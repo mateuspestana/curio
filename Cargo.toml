@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Matheus C. Pestana <MACAPE Pesquisas e Consultoria em Tecnologia Ltda>"]
 description = "Curió — TUI para monitorar mudanças em URLs"
-license = "MIT"
+license = "GPL-3.0-only"
 readme = "README.md"
 
 [[bin]]

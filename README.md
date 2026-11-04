@@ -52,6 +52,6 @@ Detecção usa **texto visível normalizado**. Em falha de rede/HTTP, Curió ten
 
 ## Licença
 
-MIT — ver [LICENSE](LICENSE).
+[GNU GPL v3](LICENSE) (GPL-3.0-only).
 
 Copyright (c) 2026 Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
