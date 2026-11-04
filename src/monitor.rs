@@ -1,4 +1,4 @@
-//! Async URL monitor with retry policy.
+//! Async URL monitor with retry policy, pause, and force-check.
 //! Author: Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
 
 use crate::db::Database;
@@ -11,7 +11,7 @@ use crate::notify::{notify_change, notify_downtime};
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -19,24 +19,25 @@ use tokio::time::{sleep, Instant};
 
 /// Shared next-check schedule visible to the TUI (watch_id -> Instant).
 pub type ScheduleMap = Arc<Mutex<HashMap<i64, Instant>>>;
+/// Watch IDs requested for immediate check.
+pub type ForceCheckSet = Arc<Mutex<HashSet<i64>>>;
 
 pub async fn run_monitor(
     db_path: PathBuf,
     tx: mpsc::UnboundedSender<AppEvent>,
     schedule: ScheduleMap,
     reload: Arc<Mutex<bool>>,
+    force: ForceCheckSet,
 ) {
     let client = Client::builder()
-        .user_agent("Curio/0.1 (+MACAPE; https://github.com/macape/curio)")
+        .user_agent("Curio/0.2 (+MACAPE; https://github.com/mateuspestana/curio)")
         .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()
         .expect("http client");
 
-    // Per-watch next due time
     let mut due: HashMap<i64, Instant> = HashMap::new();
 
     loop {
-        // Reload watches if TUI requested
         {
             let mut flag = reload.lock().await;
             if *flag {
@@ -44,6 +45,13 @@ pub async fn run_monitor(
                 due.clear();
             }
         }
+
+        let forced: HashSet<i64> = {
+            let mut set = force.lock().await;
+            let copy = set.clone();
+            set.clear();
+            copy
+        };
 
         let watches = match open_db(&db_path).and_then(|db| db.list_watches()) {
             Ok(w) => w,
@@ -56,15 +64,16 @@ pub async fn run_monitor(
 
         let now = Instant::now();
         let watch_ids: Vec<i64> = watches.iter().map(|w| w.id).collect();
-
-        // Drop schedules for deleted watches
         due.retain(|id, _| watch_ids.contains(id));
 
         for w in &watches {
+            if w.paused {
+                due.remove(&w.id);
+                continue;
+            }
             due.entry(w.id).or_insert(now);
         }
 
-        // Update shared schedule for UI countdown
         {
             let mut map = schedule.lock().await;
             *map = due.clone();
@@ -74,8 +83,13 @@ pub async fn run_monitor(
         let mut ran_any = false;
 
         for w in watches {
+            if w.paused && !forced.contains(&w.id) {
+                continue;
+            }
+
+            let force_this = forced.contains(&w.id);
             let when = *due.get(&w.id).unwrap_or(&now);
-            if when > now {
+            if !force_this && when > now {
                 if when < next_wake {
                     next_wake = when;
                 }
@@ -83,7 +97,7 @@ pub async fn run_monitor(
             }
 
             ran_any = true;
-            let result = check_watch(&client, &db_path, w.id).await;
+            let result = check_watch(&client, &db_path, w.id, force_this).await;
             match result {
                 CheckOutcome::Ok { watch, changed } => {
                     due.insert(
@@ -121,6 +135,7 @@ pub async fn run_monitor(
                     });
                     let _ = tx.send(AppEvent::WatchUpdated(watch));
                 }
+                CheckOutcome::SkippedPaused => {}
                 CheckOutcome::Fatal(e) => {
                     eprintln!("falha fatal na verificação: {e}");
                     due.insert(w.id, Instant::now() + std::time::Duration::from_secs(60));
@@ -130,7 +145,7 @@ pub async fn run_monitor(
 
         if !ran_any {
             let sleep_for = next_wake.saturating_duration_since(Instant::now());
-            let sleep_for = sleep_for.min(std::time::Duration::from_millis(500));
+            let sleep_for = sleep_for.min(std::time::Duration::from_millis(400));
             sleep(sleep_for).await;
             let _ = tx.send(AppEvent::Tick);
         } else {
@@ -140,21 +155,19 @@ pub async fn run_monitor(
 }
 
 enum CheckOutcome {
-    Ok {
-        watch: crate::model::Watch,
-        changed: bool,
-    },
-    Retry {
-        watch: crate::model::Watch,
-    },
-    Downtime {
-        watch: crate::model::Watch,
-        error: String,
-    },
+    Ok { watch: crate::model::Watch, changed: bool },
+    Retry { watch: crate::model::Watch },
+    Downtime { watch: crate::model::Watch, error: String },
+    SkippedPaused,
     Fatal(anyhow::Error),
 }
 
-async fn check_watch(client: &Client, db_path: &PathBuf, watch_id: i64) -> CheckOutcome {
+async fn check_watch(
+    client: &Client,
+    db_path: &PathBuf,
+    watch_id: i64,
+    force: bool,
+) -> CheckOutcome {
     let db = match open_db(db_path) {
         Ok(d) => d,
         Err(e) => return CheckOutcome::Fatal(e),
@@ -164,6 +177,10 @@ async fn check_watch(client: &Client, db_path: &PathBuf, watch_id: i64) -> Check
         Ok(None) => return CheckOutcome::Fatal(anyhow::anyhow!("watch removido")),
         Err(e) => return CheckOutcome::Fatal(e),
     };
+
+    if watch.paused && !force {
+        return CheckOutcome::SkippedPaused;
+    }
 
     let fetch = client.get(&watch.url).send().await;
     let body = match fetch {
@@ -182,7 +199,28 @@ async fn check_watch(client: &Client, db_path: &PathBuf, watch_id: i64) -> Check
 
     match body {
         Ok(html) => {
-            let (text, hash) = normalize_and_hash(&html);
+            let (text, hash) = match normalize_and_hash(&html, &watch.selector, &watch.ignore_regex)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if let Err(err) =
+                        db.update_watch_check(watch_id, WatchStatus::Error, Some(&msg), 0, None)
+                    {
+                        return CheckOutcome::Fatal(err);
+                    }
+                    let updated = match db.get_watch(watch_id) {
+                        Ok(Some(w)) => w,
+                        Ok(None) => return CheckOutcome::Fatal(anyhow::anyhow!("watch removido")),
+                        Err(err) => return CheckOutcome::Fatal(err),
+                    };
+                    return CheckOutcome::Downtime {
+                        watch: updated,
+                        error: msg,
+                    };
+                }
+            };
+
             let prev = match db.latest_snapshot(watch_id) {
                 Ok(s) => s,
                 Err(e) => return CheckOutcome::Fatal(e),
@@ -201,8 +239,7 @@ async fn check_watch(client: &Client, db_path: &PathBuf, watch_id: i64) -> Check
                     }
                 }
                 Some(prev) if prev.content_hash == hash => {
-                    if let Err(e) =
-                        db.update_watch_check(watch_id, WatchStatus::Ok, None, 0, None)
+                    if let Err(e) = db.update_watch_check(watch_id, WatchStatus::Ok, None, 0, None)
                     {
                         return CheckOutcome::Fatal(e);
                     }
@@ -224,6 +261,10 @@ async fn check_watch(client: &Client, db_path: &PathBuf, watch_id: i64) -> Check
                 }
             }
 
+            if watch.paused {
+                let _ = db.set_paused(watch_id, true);
+            }
+
             match db.get_watch(watch_id) {
                 Ok(Some(w)) => CheckOutcome::Ok { watch: w, changed },
                 Ok(None) => CheckOutcome::Fatal(anyhow::anyhow!("watch removido")),
@@ -232,13 +273,8 @@ async fn check_watch(client: &Client, db_path: &PathBuf, watch_id: i64) -> Check
         }
         Err(error) => {
             let failures = watch.consecutive_failures.saturating_add(1);
-            let status = if failures >= MAX_FETCH_ATTEMPTS {
-                WatchStatus::Error
-            } else {
-                WatchStatus::Error
-            };
             if let Err(e) =
-                db.update_watch_check(watch_id, status, Some(&error), failures, None)
+                db.update_watch_check(watch_id, WatchStatus::Error, Some(&error), failures, None)
             {
                 return CheckOutcome::Fatal(e);
             }
@@ -251,7 +287,6 @@ async fn check_watch(client: &Client, db_path: &PathBuf, watch_id: i64) -> Check
             if failures < MAX_FETCH_ATTEMPTS {
                 CheckOutcome::Retry { watch: updated }
             } else {
-                // Reset failure counter so the next normal interval cycle can retry again later
                 let _ = db.update_watch_check(
                     watch_id,
                     WatchStatus::Error,
@@ -281,7 +316,6 @@ fn display_label(label: &str, url: &str) -> String {
     }
 }
 
-/// Compute a wall-clock estimate for UI (optional helper).
 #[allow(dead_code)]
 pub fn eta_from_instant(target: Instant) -> chrono::DateTime<Utc> {
     let dur = target.saturating_duration_since(Instant::now());

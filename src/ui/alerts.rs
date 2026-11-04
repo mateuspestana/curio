@@ -47,7 +47,7 @@ pub fn draw(
 
     let list = List::new(items).block(
         Block::default()
-            .title(" Alertas ")
+            .title(" Alertas · m marca todos como lidos ")
             .title_style(theme::panel_title())
             .borders(Borders::ALL)
             .border_style(theme::border())

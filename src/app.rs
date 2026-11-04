@@ -2,11 +2,12 @@
 //! Author: Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
 
 use crate::db::Database;
+use crate::extract::normalize_and_hash;
 use crate::interval::{format_interval, parse_interval};
-use crate::model::{AppEvent, Change, Watch};
-use crate::monitor::ScheduleMap;
-use crate::ui::{alerts, dashboard, form, history, theme, widgets};
+use crate::model::{AppEvent, AppSettings, Change, Watch};
+use crate::monitor::{ForceCheckSet, ScheduleMap};
 use crate::ui::form::{FormField, FormState};
+use crate::ui::{alerts, dashboard, form, history, theme, widgets};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -43,8 +44,11 @@ pub struct App {
     diff_scroll: u16,
     alerts: Vec<(Change, String, String)>,
     flash: Vec<String>,
+    settings: AppSettings,
+    unread_total: u64,
     schedule: ScheduleMap,
     reload: Arc<Mutex<bool>>,
+    force: ForceCheckSet,
     events: mpsc::UnboundedReceiver<AppEvent>,
     should_quit: bool,
 }
@@ -54,8 +58,11 @@ impl App {
         db_path: PathBuf,
         schedule: ScheduleMap,
         reload: Arc<Mutex<bool>>,
+        force: ForceCheckSet,
         events: mpsc::UnboundedReceiver<AppEvent>,
     ) -> Result<Self> {
+        let settings = Database::open_path(&db_path)?.load_settings()?;
+        theme::set_mode(settings.theme);
         let mut app = Self {
             db_path,
             watches: Vec::new(),
@@ -67,8 +74,11 @@ impl App {
             diff_scroll: 0,
             alerts: Vec::new(),
             flash: Vec::new(),
+            settings,
+            unread_total: 0,
             schedule,
             reload,
+            force,
             events,
             should_quit: false,
         };
@@ -82,7 +92,9 @@ impl App {
     }
 
     fn reload_watches(&mut self) -> Result<()> {
-        self.watches = self.db()?.list_watches()?;
+        let db = self.db()?;
+        self.watches = db.list_watches()?;
+        self.unread_total = db.unread_count()?;
         if self.selected >= self.watches.len() && !self.watches.is_empty() {
             self.selected = self.watches.len() - 1;
         }
@@ -96,6 +108,10 @@ impl App {
 
     async fn request_reload(&self) {
         *self.reload.lock().await = true;
+    }
+
+    async fn request_force_check(&self, id: i64) {
+        self.force.lock().await.insert(id);
     }
 
     pub async fn run(
@@ -127,8 +143,7 @@ impl App {
                 self.reload_watches()?;
             }
             AppEvent::ChangeDetected { label, .. } => {
-                self.flash
-                    .push(format!("Mudança detectada: {label}"));
+                self.flash.push(format!("Mudança detectada: {label}"));
                 if self.flash.len() > 30 {
                     self.flash.remove(0);
                 }
@@ -149,9 +164,7 @@ impl App {
 
     fn draw(&self, frame: &mut ratatui::Frame, schedule: &HashMap<i64, Instant>) {
         let area = frame.area();
-        // Clear with background
-        let bg = Block::default().style(theme::normal());
-        frame.render_widget(bg, area);
+        frame.render_widget(Block::default().style(theme::normal()), area);
 
         let (header, body, footer) = widgets::main_chunks(area);
         let subtitle = match self.screen {
@@ -166,13 +179,17 @@ impl App {
 
         match self.screen {
             Screen::Dashboard | Screen::ConfirmDelete => {
-                dashboard::draw(frame, body, &self.watches, self.selected, schedule);
+                dashboard::draw(
+                    frame,
+                    body,
+                    &self.watches,
+                    self.selected,
+                    schedule,
+                    self.settings.density,
+                    self.unread_total,
+                );
                 if self.screen == Screen::ConfirmDelete {
-                    draw_modal(
-                        frame,
-                        body,
-                        "Excluir este monitor? [s] sim  [n] não",
-                    );
+                    draw_modal(frame, body, "Excluir este monitor? [s] sim  [n] não");
                 }
             }
             Screen::Form => form::draw(frame, body, &self.form),
@@ -180,13 +197,7 @@ impl App {
                 let title = self
                     .watches
                     .get(self.selected)
-                    .map(|w| {
-                        if w.label.is_empty() {
-                            w.url.clone()
-                        } else {
-                            w.label.clone()
-                        }
-                    })
+                    .map(|w| w.display_name().to_string())
                     .unwrap_or_default();
                 history::draw(
                     frame,
@@ -201,18 +212,29 @@ impl App {
             Screen::Help => draw_help(frame, body),
         }
 
-        let hints = match self.screen {
-            Screen::Dashboard => {
-                "a adicionar · e editar · d excluir · o abrir · h histórico · l alertas · ? ajuda · q sair"
-            }
-            Screen::Form => "Tab campo · Enter salvar · Esc cancelar",
-            Screen::History => {
-                "↑↓ mudança · PgUp/PgDn rolar · m marcar visto · Esc voltar · o abrir"
-            }
-            Screen::Alerts => "m marcar todos vistos · Esc voltar",
-            Screen::Help | Screen::ConfirmDelete => "Esc voltar",
+        let theme_hint = match self.settings.theme {
+            crate::model::ThemeMode::Dark => "escuro",
+            crate::model::ThemeMode::Light => "claro",
         };
-        widgets::draw_footer(frame, footer, hints);
+        let dens = match self.settings.density {
+            crate::model::Density::Normal => "normal",
+            crate::model::Density::Compact => "compacta",
+        };
+
+        let hints = match self.screen {
+            Screen::Dashboard => format!(
+                "a add · e edit · d del · p pausar · r checar · o abrir · h hist · l alertas · m lidos · t tema({theme_hint}) · c dens({dens}) · ? · q"
+            ),
+            Screen::Form => {
+                "Tab campo · v prévia · Enter salvar · Esc cancelar".into()
+            }
+            Screen::History => {
+                "↑↓ · PgUp/PgDn · m visto · Esc · o abrir".into()
+            }
+            Screen::Alerts => "m marcar todos vistos · Esc voltar".into(),
+            Screen::Help | Screen::ConfirmDelete => "Esc voltar".into(),
+        };
+        widgets::draw_footer(frame, footer, &hints);
     }
 
     async fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<()> {
@@ -251,6 +273,8 @@ impl App {
                         w.url,
                         w.label,
                         format_interval(w.interval_secs),
+                        w.selector,
+                        w.ignore_regex,
                     );
                     self.screen = Screen::Form;
                 }
@@ -258,6 +282,32 @@ impl App {
             KeyCode::Char('d') => {
                 if !self.watches.is_empty() {
                     self.screen = Screen::ConfirmDelete;
+                }
+            }
+            KeyCode::Char('p') => {
+                let pause = self
+                    .watches
+                    .get(self.selected)
+                    .map(|w| (w.id, w.display_name().to_string(), !w.paused));
+                if let Some((id, name, new_paused)) = pause {
+                    self.db()?.set_paused(id, new_paused)?;
+                    self.reload_watches()?;
+                    self.request_reload().await;
+                    self.flash.push(if new_paused {
+                        format!("Pausado: {name}")
+                    } else {
+                        format!("Retomado: {name}")
+                    });
+                }
+            }
+            KeyCode::Char('r') => {
+                let force = self
+                    .watches
+                    .get(self.selected)
+                    .map(|w| (w.id, w.display_name().to_string()));
+                if let Some((id, name)) = force {
+                    self.request_force_check(id).await;
+                    self.flash.push(format!("Checando agora: {name}"));
                 }
             }
             KeyCode::Char('o') => {
@@ -276,6 +326,30 @@ impl App {
             KeyCode::Char('l') => {
                 self.reload_alerts()?;
                 self.screen = Screen::Alerts;
+            }
+            KeyCode::Char('m') => {
+                if let Some(w) = self.watches.get(self.selected) {
+                    if w.unread_change {
+                        self.db()?.mark_changes_seen_for_watch(w.id)?;
+                    } else {
+                        self.db()?.mark_all_changes_seen()?;
+                    }
+                } else {
+                    self.db()?.mark_all_changes_seen()?;
+                }
+                self.reload_watches()?;
+                self.reload_alerts()?;
+                self.flash
+                    .push("Marcado como lido.".into());
+            }
+            KeyCode::Char('t') => {
+                self.settings.theme = self.settings.theme.toggle();
+                theme::set_mode(self.settings.theme);
+                self.db()?.save_settings(&self.settings)?;
+            }
+            KeyCode::Char('c') => {
+                self.settings.density = self.settings.density.toggle();
+                self.db()?.save_settings(&self.settings)?;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if !self.watches.is_empty() {
@@ -297,21 +371,75 @@ impl App {
     }
 
     async fn key_form(&mut self, code: KeyCode) -> Result<()> {
+        if self.form.preview.is_some() {
+            match code {
+                KeyCode::Esc | KeyCode::Char('v') => {
+                    self.form.preview = None;
+                    self.form.preview_scroll = 0;
+                }
+                KeyCode::PageDown => self.form.preview_scroll = self.form.preview_scroll.saturating_add(5),
+                KeyCode::PageUp => self.form.preview_scroll = self.form.preview_scroll.saturating_sub(5),
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match code {
             KeyCode::Esc => self.screen = Screen::Dashboard,
             KeyCode::Tab | KeyCode::Down => self.form.next_field(),
             KeyCode::BackTab | KeyCode::Up => self.form.prev_field(),
+            KeyCode::F(5) => self.run_preview().await?,
+            KeyCode::Char('v')
+                if matches!(
+                    self.form.focus,
+                    FormField::Url | FormField::Label | FormField::Interval
+                ) =>
+            {
+                self.run_preview().await?;
+            }
             KeyCode::Enter => self.submit_form().await?,
             KeyCode::Backspace => {
                 self.form.focused_mut().pop();
             }
-            KeyCode::Char(c) => {
-                // Ignore control-ish chars
-                if !c.is_control() {
-                    self.form.focused_mut().push(c);
-                }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.form.focused_mut().push(c);
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn run_preview(&mut self) -> Result<()> {
+        self.form.error = None;
+        let url = self.form.url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            self.form.error = Some("URL inválida para prévia".into());
+            return Ok(());
+        }
+        let client = reqwest::Client::builder()
+            .user_agent("Curio/0.2 (+MACAPE)")
+            .timeout(Duration::from_secs(15))
+            .build()?;
+        let resp = client.get(url).send().await;
+        match resp {
+            Ok(r) if r.status().is_success() => match r.text().await {
+                Ok(html) => match normalize_and_hash(&html, &self.form.selector, &self.form.ignore_regex)
+                {
+                    Ok((text, hash)) => {
+                        let preview = if text.is_empty() {
+                            "(vazio após normalização/filtros)".into()
+                        } else {
+                            format!("hash: {hash}\n\n{text}")
+                        };
+                        self.form.preview = Some(preview);
+                        self.form.preview_scroll = 0;
+                    }
+                    Err(e) => self.form.error = Some(e.to_string()),
+                },
+                Err(e) => self.form.error = Some(format!("ler corpo: {e}")),
+            },
+            Ok(r) => self.form.error = Some(format!("HTTP {}", r.status())),
+            Err(e) => self.form.error = Some(format!("rede: {e}")),
         }
         Ok(())
     }
@@ -332,12 +460,44 @@ impl App {
                 return Ok(());
             }
         };
+        // Validate selector / ignore by dry-run on empty html only for regex compile
+        if let Err(e) = normalize_and_hash(
+            "<html><body>teste</body></html>",
+            "",
+            &self.form.ignore_regex,
+        ) {
+            self.form.error = Some(e.to_string());
+            self.form.focus = FormField::IgnoreRegex;
+            return Ok(());
+        }
+        if !self.form.selector.trim().is_empty() {
+            if let Err(e) = normalize_and_hash(
+                "<html><body><div id=\"x\">ok</div></body></html>",
+                self.form.selector.trim(),
+                "",
+            ) {
+                // NoMatch is ok for validation of CSS syntax on sample; InvalidCss is not
+                if !matches!(e, crate::extract::ExtractError::NoMatch) {
+                    // XPath unsupported or invalid css
+                    if matches!(e, crate::extract::ExtractError::InvalidCss(_))
+                        || matches!(e, crate::extract::ExtractError::XPathUnsupported)
+                    {
+                        self.form.error = Some(e.to_string());
+                        self.form.focus = FormField::Selector;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let label = self.form.label.trim().to_string();
+        let selector = self.form.selector.trim().to_string();
+        let ignore_regex = self.form.ignore_regex.clone();
         let db = self.db()?;
         if let Some(id) = self.form.editing_id {
-            db.update_watch(id, &url, &label, interval)?;
+            db.update_watch(id, &url, &label, interval, &selector, &ignore_regex)?;
         } else {
-            db.insert_watch(&url, &label, interval)?;
+            db.insert_watch(&url, &label, interval, &selector, &ignore_regex)?;
         }
         self.reload_watches()?;
         self.request_reload().await;
@@ -417,20 +577,25 @@ impl App {
 
 fn draw_help(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     let text = "\
-Curió — atalhos
+Curió v0.2 — atalhos
 
   a          adicionar monitor
   e          editar selecionado
   d          excluir selecionado
+  p          pausar / retomar
+  r          checar agora
   o          abrir URL no navegador
   h          histórico / diferenças
   l          painel de alertas
-  m          marcar como visto
+  m          marcar lido (selecionado ou todos)
+  t          alternar tema claro/escuro
+  c          densidade normal/compacta
+  v / F5     prévia do texto (no formulário)
   ?          esta ajuda
   q          sair
 
-Detecção: texto visível normalizado.
-Falhas de rede: até 3 tentativas (intervalo de 5 min entre novas tentativas).
+Seletor: CSS (#id, .classe) ou XPath comum (//*[@id='x']).
+Ignorar: uma regex por linha; linhas casadas saem da comparação.
 ";
     let p = Paragraph::new(text).style(theme::normal()).block(
         Block::default()
@@ -448,7 +613,7 @@ fn draw_modal(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, msg: &str
     let p = Paragraph::new(msg).style(theme::selected()).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(ratatui::style::Style::default().fg(theme::ACCENT)),
+            .border_style(ratatui::style::Style::default().fg(theme::accent_fg())),
     );
     frame.render_widget(p, popup);
 }

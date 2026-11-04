@@ -1,11 +1,12 @@
 [package]
 name = "curio"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Matheus C. Pestana <MACAPE Pesquisas e Consultoria em Tecnologia Ltda>"]
 description = "Curió — TUI para monitorar mudanças em URLs"
 license = "GPL-3.0-only"
 readme = "README.md"
+repository = "https://github.com/mateuspestana/curio"
 
 [[bin]]
 name = "curio"
@@ -19,8 +20,10 @@ html2text = "0.13"
 notify-rust = "4"
 open = "5"
 ratatui = "0.29"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+scraper = "0.22"
 sha2 = "0.10"
 similar = "2"
 thiserror = "2"

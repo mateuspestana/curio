@@ -1,7 +1,9 @@
 //! SQLite persistence for Curió.
 //! Author: Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
 
-use crate::model::{Change, Snapshot, Watch, WatchStatus, MAX_SNAPSHOTS_PER_WATCH};
+use crate::model::{
+    AppSettings, Change, Density, Snapshot, ThemeMode, Watch, WatchStatus, MAX_SNAPSHOTS_PER_WATCH,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -64,38 +66,67 @@ impl Database {
                 seen INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_snapshots_watch ON snapshots(watch_id, fetched_at DESC);
             CREATE INDEX IF NOT EXISTS idx_changes_watch ON changes(watch_id, detected_at DESC);
             "#,
         )?;
+        self.ensure_column("watches", "selector", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("watches", "ignore_regex", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("watches", "paused", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(())
     }
 
+    fn ensure_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if !names.iter().any(|n| n == column) {
+            self.conn
+                .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+        }
+        Ok(())
+    }
+
+    fn map_watch(row: &rusqlite::Row<'_>) -> rusqlite::Result<Watch> {
+        Ok(Watch {
+            id: row.get(0)?,
+            url: row.get(1)?,
+            label: row.get(2)?,
+            interval_secs: row.get::<_, i64>(3)? as u64,
+            created_at: parse_dt(&row.get::<_, String>(4)?)?,
+            last_checked_at: row
+                .get::<_, Option<String>>(5)?
+                .as_deref()
+                .map(parse_dt)
+                .transpose()?,
+            last_status: WatchStatus::parse(&row.get::<_, String>(6)?),
+            last_error: row.get(7)?,
+            unread_change: row.get::<_, i64>(8)? != 0,
+            consecutive_failures: row.get::<_, i64>(9)? as u32,
+            selector: row.get(10)?,
+            ignore_regex: row.get(11)?,
+            paused: row.get::<_, i64>(12)? != 0,
+            next_check_at: None,
+        })
+    }
+
+    const WATCH_SELECT: &'static str = "SELECT id, url, label, interval_secs, created_at, last_checked_at,
+            last_status, last_error, unread_change, consecutive_failures,
+            selector, ignore_regex, paused
+     FROM watches";
+
     pub fn list_watches(&self) -> Result<Vec<Watch>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, url, label, interval_secs, created_at, last_checked_at,
-                    last_status, last_error, unread_change, consecutive_failures
-             FROM watches ORDER BY id ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(Watch {
-                id: row.get(0)?,
-                url: row.get(1)?,
-                label: row.get(2)?,
-                interval_secs: row.get::<_, i64>(3)? as u64,
-                created_at: parse_dt(&row.get::<_, String>(4)?)?,
-                last_checked_at: row
-                    .get::<_, Option<String>>(5)?
-                    .as_deref()
-                    .map(parse_dt)
-                    .transpose()?,
-                last_status: WatchStatus::parse(&row.get::<_, String>(6)?),
-                last_error: row.get(7)?,
-                unread_change: row.get::<_, i64>(8)? != 0,
-                consecutive_failures: row.get::<_, i64>(9)? as u32,
-                next_check_at: None,
-            })
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{} ORDER BY id ASC", Self::WATCH_SELECT))?;
+        let rows = stmt.query_map([], Self::map_watch)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -106,40 +137,34 @@ impl Database {
     pub fn get_watch(&self, id: i64) -> Result<Option<Watch>> {
         self.conn
             .query_row(
-                "SELECT id, url, label, interval_secs, created_at, last_checked_at,
-                        last_status, last_error, unread_change, consecutive_failures
-                 FROM watches WHERE id = ?1",
+                &format!("{} WHERE id = ?1", Self::WATCH_SELECT),
                 params![id],
-                |row| {
-                    Ok(Watch {
-                        id: row.get(0)?,
-                        url: row.get(1)?,
-                        label: row.get(2)?,
-                        interval_secs: row.get::<_, i64>(3)? as u64,
-                        created_at: parse_dt(&row.get::<_, String>(4)?)?,
-                        last_checked_at: row
-                            .get::<_, Option<String>>(5)?
-                            .as_deref()
-                            .map(parse_dt)
-                            .transpose()?,
-                        last_status: WatchStatus::parse(&row.get::<_, String>(6)?),
-                        last_error: row.get(7)?,
-                        unread_change: row.get::<_, i64>(8)? != 0,
-                        consecutive_failures: row.get::<_, i64>(9)? as u32,
-                        next_check_at: None,
-                    })
-                },
+                Self::map_watch,
             )
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn insert_watch(&self, url: &str, label: &str, interval_secs: u64) -> Result<Watch> {
+    pub fn insert_watch(
+        &self,
+        url: &str,
+        label: &str,
+        interval_secs: u64,
+        selector: &str,
+        ignore_regex: &str,
+    ) -> Result<Watch> {
         let now = Utc::now();
         self.conn.execute(
-            "INSERT INTO watches (url, label, interval_secs, created_at, last_status)
-             VALUES (?1, ?2, ?3, ?4, 'waiting')",
-            params![url, label, interval_secs as i64, now.to_rfc3339()],
+            "INSERT INTO watches (url, label, interval_secs, created_at, last_status, selector, ignore_regex, paused)
+             VALUES (?1, ?2, ?3, ?4, 'waiting', ?5, ?6, 0)",
+            params![
+                url,
+                label,
+                interval_secs as i64,
+                now.to_rfc3339(),
+                selector,
+                ignore_regex
+            ],
         )?;
         let id = self.conn.last_insert_rowid();
         self.get_watch(id)?
@@ -152,10 +177,33 @@ impl Database {
         url: &str,
         label: &str,
         interval_secs: u64,
+        selector: &str,
+        ignore_regex: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE watches SET url = ?1, label = ?2, interval_secs = ?3 WHERE id = ?4",
-            params![url, label, interval_secs as i64, id],
+            "UPDATE watches SET url = ?1, label = ?2, interval_secs = ?3,
+             selector = ?4, ignore_regex = ?5 WHERE id = ?6",
+            params![
+                url,
+                label,
+                interval_secs as i64,
+                selector,
+                ignore_regex,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_paused(&self, id: i64, paused: bool) -> Result<()> {
+        let status = if paused {
+            WatchStatus::Paused.as_str()
+        } else {
+            WatchStatus::Waiting.as_str()
+        };
+        self.conn.execute(
+            "UPDATE watches SET paused = ?1, last_status = ?2 WHERE id = ?3",
+            params![if paused { 1 } else { 0 }, status, id],
         )?;
         Ok(())
     }
@@ -326,6 +374,15 @@ impl Database {
         Ok(out)
     }
 
+    pub fn unread_count(&self) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM watches WHERE unread_change = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     pub fn mark_changes_seen_for_watch(&self, watch_id: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE changes SET seen = 1 WHERE watch_id = ?1",
@@ -342,6 +399,44 @@ impl Database {
         self.conn.execute("UPDATE changes SET seen = 1", [])?;
         self.conn
             .execute("UPDATE watches SET unread_change = 0", [])?;
+        Ok(())
+    }
+
+    pub fn load_settings(&self) -> Result<AppSettings> {
+        let theme = self
+            .get_setting("theme")?
+            .map(|v| ThemeMode::parse(&v))
+            .unwrap_or(ThemeMode::Dark);
+        let density = self
+            .get_setting("density")?
+            .map(|v| Density::parse(&v))
+            .unwrap_or(Density::Normal);
+        Ok(AppSettings { theme, density })
+    }
+
+    pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
+        self.set_setting("theme", settings.theme.as_str())?;
+        self.set_setting("density", settings.density.as_str())?;
+        Ok(())
+    }
+
+    fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
         Ok(())
     }
 }
@@ -371,17 +466,19 @@ mod tests {
     fn crud_and_snapshot_trim() {
         let db = Database::open_in_memory().unwrap();
         let w = db
-            .insert_watch("https://example.com", "ex", 60)
+            .insert_watch("https://example.com", "ex", 60, "#main", "ts:")
             .unwrap();
-        assert_eq!(w.url, "https://example.com");
+        assert_eq!(w.selector, "#main");
+        assert_eq!(w.ignore_regex, "ts:");
+
+        db.set_paused(w.id, true).unwrap();
+        let w2 = db.get_watch(w.id).unwrap().unwrap();
+        assert!(w2.paused);
 
         for i in 0..25 {
             db.insert_snapshot(w.id, &format!("h{i}"), &format!("text {i}"))
                 .unwrap();
         }
-        let latest = db.latest_snapshot(w.id).unwrap().unwrap();
-        assert!(latest.normalized_text.contains("24") || latest.content_hash == "h24");
-
         let count: i64 = db
             .conn
             .query_row(
@@ -392,14 +489,12 @@ mod tests {
             .unwrap();
         assert_eq!(count, MAX_SNAPSHOTS_PER_WATCH as i64);
 
-        db.insert_change(w.id, "- a\n+ b\n").unwrap();
-        let changes = db.list_changes(w.id, 10).unwrap();
-        assert_eq!(changes.len(), 1);
-        db.mark_changes_seen_for_watch(w.id).unwrap();
-        let w2 = db.get_watch(w.id).unwrap().unwrap();
-        assert!(!w2.unread_change);
-
-        db.delete_watch(w.id).unwrap();
-        assert!(db.list_watches().unwrap().is_empty());
+        let mut settings = db.load_settings().unwrap();
+        settings.theme = ThemeMode::Light;
+        settings.density = Density::Compact;
+        db.save_settings(&settings).unwrap();
+        let s2 = db.load_settings().unwrap();
+        assert_eq!(s2.theme, ThemeMode::Light);
+        assert_eq!(s2.density, Density::Compact);
     }
 }

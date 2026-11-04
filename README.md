@@ -22,13 +22,7 @@ Ou em desenvolvimento:
 cargo run
 ```
 
-Binários pré-compilados em `dist/`:
-
-| Arquivo | Plataforma |
-|---------|------------|
-| `curio-macos-aarch64` | macOS Apple Silicon |
-| `curio-linux-x86_64` | Linux x86_64 |
-| `curio-windows-x86_64.exe` | Windows x86_64 |
+Binários pré-compilados na [página de releases](https://github.com/mateuspestana/curio/releases).
 
 Interface e mensagens em **português**. Dados em `~/.curio/curio.db`.
 
@@ -39,16 +33,21 @@ Interface e mensagens em **português**. Dados em `~/.curio/curio.db`.
 | `a` | Adicionar monitor |
 | `e` | Editar selecionado |
 | `d` | Excluir selecionado |
+| `p` | Pausar / retomar |
+| `r` | Checar agora |
 | `o` | Abrir URL no browser |
 | `h` | Histórico / diffs |
 | `l` | Painel de alertas |
-| `m` | Marcar como visto |
+| `m` | Marcar como lido |
+| `t` | Tema claro/escuro |
+| `c` | Densidade normal/compacta |
+| `v` / `F5` | Prévia do texto (no formulário) |
 | `?` | Ajuda |
 | `q` | Sair |
 
 Intervalos: `10s`, `50m`, `2h`, `2d`, `1w` (mínimo 5s).
 
-Detecção usa **texto visível normalizado**. Em falha de rede/HTTP, Curió tenta de novo até 2 vezes com intervalo de **5 minutos**; se as 3 tentativas falharem, notifica downtime.
+Detecção usa **texto visível normalizado**, com seletor CSS/XPath opcional e regex de linhas a ignorar. Em falha de rede/HTTP, Curió tenta de novo até 2 vezes com intervalo de **5 minutos**; se as 3 tentativas falharem, notifica downtime.
 
 ## Licença
 

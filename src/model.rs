@@ -18,6 +18,7 @@ pub enum WatchStatus {
     Ok,
     Changed,
     Error,
+    Paused,
 }
 
 impl WatchStatus {
@@ -27,6 +28,7 @@ impl WatchStatus {
             Self::Ok => "ok",
             Self::Changed => "changed",
             Self::Error => "error",
+            Self::Paused => "paused",
         }
     }
 
@@ -35,7 +37,81 @@ impl WatchStatus {
             "ok" => Self::Ok,
             "changed" => Self::Changed,
             "error" => Self::Error,
+            "paused" => Self::Paused,
             _ => Self::Waiting,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeMode {
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "light" => Self::Light,
+            _ => Self::Dark,
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Density {
+    Normal,
+    Compact,
+}
+
+impl Density {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Compact => "compact",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "compact" => Self::Compact,
+            _ => Self::Normal,
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Normal => Self::Compact,
+            Self::Compact => Self::Normal,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AppSettings {
+    pub theme: ThemeMode,
+    pub density: Density,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemeMode::Dark,
+            density: Density::Normal,
         }
     }
 }
@@ -47,6 +123,9 @@ pub struct Watch {
     pub url: String,
     pub label: String,
     pub interval_secs: u64,
+    pub selector: String,
+    pub ignore_regex: String,
+    pub paused: bool,
     pub created_at: DateTime<Utc>,
     pub last_checked_at: Option<DateTime<Utc>>,
     pub last_status: WatchStatus,
@@ -54,6 +133,16 @@ pub struct Watch {
     pub unread_change: bool,
     pub consecutive_failures: u32,
     pub next_check_at: Option<DateTime<Utc>>,
+}
+
+impl Watch {
+    pub fn display_name(&self) -> &str {
+        if self.label.is_empty() {
+            &self.url
+        } else {
+            &self.label
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

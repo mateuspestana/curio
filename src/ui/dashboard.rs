@@ -2,7 +2,7 @@
 //! Author: Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
 
 use crate::interval::format_interval;
-use crate::model::{Watch, WatchStatus};
+use crate::model::{Density, Watch, WatchStatus};
 use crate::ui::theme;
 use chrono::Utc;
 use ratatui::{
@@ -22,41 +22,71 @@ pub fn draw(
     watches: &[Watch],
     selected: usize,
     schedule: &HashMap<i64, Instant>,
+    density: Density,
+    unread_total: u64,
 ) {
+    let compact = density == Density::Compact;
     let items: Vec<ListItem> = watches
         .iter()
-        .enumerate()
-        .map(|(_i, w)| {
+        .map(|w| {
             let name = if w.label.is_empty() {
-                truncate(&w.url, 40)
+                truncate(&w.url, if compact { 28 } else { 36 })
             } else {
-                truncate(&w.label, 28)
+                truncate(&w.label, if compact { 20 } else { 28 })
             };
-            let unread = if w.unread_change { " ●" } else { "  " };
-            let status = status_label(w.last_status);
-            let status_style = status_style(w.last_status);
+            let badge = if w.unread_change {
+                " ● NOVO "
+            } else {
+                "        "
+            };
+            let paused = if w.paused { "⏸ " } else { "  " };
+            let status = status_label(w);
+            let status_style = status_style(w.last_status, w.paused);
             let interval = format_interval(w.interval_secs);
-            let eta = countdown(schedule.get(&w.id).copied());
+            let eta = if w.paused {
+                "pausado".into()
+            } else {
+                countdown(schedule.get(&w.id).copied())
+            };
             let last = w
                 .last_checked_at
                 .map(|t| t.with_timezone(&Utc).format("%H:%M:%S").to_string())
                 .unwrap_or_else(|| "—".into());
+            let sel = if w.selector.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", truncate(&w.selector, 12))
+            };
             let err = w
                 .last_error
                 .as_deref()
-                .filter(|_| w.last_status == WatchStatus::Error)
+                .filter(|_| w.last_status == WatchStatus::Error && !w.paused)
                 .map(|e| format!(" · {e}"))
                 .unwrap_or_default();
 
-            let line = Line::from(vec![
-                Span::styled(unread, theme::status_changed()),
-                Span::styled(format!("{name:<30} "), theme::normal()),
-                Span::styled(format!("{status:<8} "), status_style),
-                Span::styled(format!("{interval:<6} "), theme::muted()),
-                Span::styled(format!("próx {eta:<8} "), theme::muted()),
-                Span::styled(format!("último {last}{err}"), theme::muted()),
-            ]);
-            ListItem::new(line)
+            let mut spans = vec![
+                Span::styled(badge, theme::status_changed()),
+                Span::styled(paused, theme::status_paused()),
+                Span::styled(format!("{name}{sel:<1} "), theme::normal()),
+            ];
+            if compact {
+                spans.push(Span::styled(format!("{status} {interval} {eta}"), status_style));
+            } else {
+                spans.extend([
+                    Span::styled(format!("{status:<9} "), status_style),
+                    Span::styled(format!("{interval:<6} "), theme::muted()),
+                    Span::styled(format!("próx {eta:<8} "), theme::muted()),
+                    Span::styled(format!("último {last}{err}"), theme::muted()),
+                ]);
+            }
+
+            let line = Line::from(spans);
+            let item = ListItem::new(line);
+            if w.unread_change {
+                item.style(theme::unread_row())
+            } else {
+                item
+            }
         })
         .collect();
 
@@ -65,10 +95,16 @@ pub fn draw(
         state.select(Some(selected.min(watches.len() - 1)));
     }
 
+    let title = if unread_total > 0 {
+        format!(" Monitores  ·  {unread_total} não lido(s) ")
+    } else {
+        " Monitores ".into()
+    };
+
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Monitores ")
+                .title(title)
                 .title_style(theme::panel_title())
                 .borders(Borders::ALL)
                 .border_style(theme::border())
@@ -80,21 +116,29 @@ pub fn draw(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn status_label(s: WatchStatus) -> &'static str {
-    match s {
+fn status_label(w: &Watch) -> &'static str {
+    if w.paused {
+        return "pausado";
+    }
+    match w.last_status {
         WatchStatus::Waiting => "aguardando",
         WatchStatus::Ok => "ok",
         WatchStatus::Changed => "mudou",
         WatchStatus::Error => "erro",
+        WatchStatus::Paused => "pausado",
     }
 }
 
-fn status_style(s: WatchStatus) -> Style {
+fn status_style(s: WatchStatus, paused: bool) -> Style {
+    if paused {
+        return theme::status_paused();
+    }
     match s {
         WatchStatus::Waiting => theme::status_waiting(),
         WatchStatus::Ok => theme::status_ok(),
         WatchStatus::Changed => theme::status_changed(),
         WatchStatus::Error => theme::status_err(),
+        WatchStatus::Paused => theme::status_paused(),
     }
 }
 
@@ -102,8 +146,7 @@ fn countdown(target: Option<Instant>) -> String {
     let Some(t) = target else {
         return "—".into();
     };
-    let d = t.saturating_duration_since(Instant::now());
-    format_duration(d)
+    format_duration(t.saturating_duration_since(Instant::now()))
 }
 
 fn format_duration(d: Duration) -> String {
