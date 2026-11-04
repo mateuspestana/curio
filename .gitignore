@@ -1,0 +1,8 @@
+/target
+/dist
+.cursor/
+*.db
+.DS_Store
+projeto.md
+AGENTS.md
+docs/
