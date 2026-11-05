@@ -31,7 +31,7 @@ pub fn draw(
         items.push(ListItem::new(Line::from(vec![
             Span::styled(format!("{mark} "), theme::status_changed()),
             Span::styled(
-                format!("{}  ", change.detected_at.format("%H:%M:%S")),
+                format!("{}  ", change.detected_at.with_timezone(&chrono::Local).format("%H:%M:%S")),
                 theme::muted(),
             ),
             Span::styled(format!("mudança · {name}"), theme::normal()),

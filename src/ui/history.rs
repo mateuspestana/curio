@@ -30,7 +30,7 @@ pub fn draw(
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{mark} "), theme::status_changed()),
                 Span::styled(
-                    c.detected_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    c.detected_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string(),
                     theme::normal(),
                 ),
             ]))

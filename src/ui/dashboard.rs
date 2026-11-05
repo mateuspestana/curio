@@ -4,7 +4,7 @@
 use crate::interval::format_interval;
 use crate::model::{Density, Watch, WatchStatus};
 use crate::ui::theme;
-use chrono::Utc;
+use chrono::Local;
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -50,7 +50,7 @@ pub fn draw(
             };
             let last = w
                 .last_checked_at
-                .map(|t| t.with_timezone(&Utc).format("%H:%M:%S").to_string())
+                .map(|t| t.with_timezone(&Local).format("%H:%M:%S").to_string())
                 .unwrap_or_else(|| "—".into());
             let sel = if w.selector.is_empty() {
                 String::new()
