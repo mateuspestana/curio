@@ -18,23 +18,35 @@ pub enum ExtractError {
     NoMatch,
 }
 
-/// Extract normalized text + hash from HTML with optional selector and ignore patterns.
+/// Largura de renderização do texto usado no hash (histórico; não alterar, ou
+/// todos os monitores existentes registrariam uma mudança falsa).
+const HASH_WIDTH: usize = 120;
+/// Largura "infinita" para o texto exibido: evita quebrar um item em duas linhas.
+const DISPLAY_WIDTH: usize = 100_000;
+
+/// Extract text + hash from HTML with optional selector and ignore patterns.
+///
+/// O hash é calculado sobre o texto com espaços colapsados (como nas versões
+/// anteriores). O texto retornado preserva uma linha por item, para que o
+/// diff mostre só os itens que mudaram.
 pub fn normalize_and_hash(
     html: &str,
     selector: &str,
     ignore_regex: &str,
 ) -> Result<(String, String), ExtractError> {
-    let raw = extract_raw_text(html, selector)?;
+    let raw = extract_raw_text(html, selector, HASH_WIDTH)?;
     let filtered = apply_ignore_filters(&raw, ignore_regex)?;
-    let normalized = normalize_text(&filtered);
-    let hash = hash_text(&normalized);
-    Ok((normalized, hash))
+    let hash = hash_text(&normalize_text(&filtered));
+
+    let raw_wide = extract_raw_text(html, selector, DISPLAY_WIDTH)?;
+    let filtered_wide = apply_ignore_filters(&raw_wide, ignore_regex)?;
+    Ok((normalize_lines(&filtered_wide), hash))
 }
 
-fn extract_raw_text(html: &str, selector: &str) -> Result<String, ExtractError> {
+fn extract_raw_text(html: &str, selector: &str, width: usize) -> Result<String, ExtractError> {
     let sel = selector.trim();
     if sel.is_empty() {
-        let text = html2text::from_read(html.as_bytes(), 120).unwrap_or_else(|_| html.to_string());
+        let text = html2text::from_read(html.as_bytes(), width).unwrap_or_else(|_| html.to_string());
         return Ok(text);
     }
 
@@ -130,6 +142,15 @@ pub fn normalize_text(text: &str) -> String {
         .to_string()
 }
 
+/// Colapsa espaços dentro de cada linha e descarta linhas vazias.
+pub fn normalize_lines(text: &str) -> String {
+    text.lines()
+        .map(normalize_text)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn hash_text(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
@@ -156,6 +177,16 @@ mod tests {
         assert!(text.to_lowercase().contains("world"));
         assert!(!text.contains("var x"));
         assert_eq!(hash.len(), 64);
+    }
+
+    #[test]
+    fn keeps_one_line_per_item_but_hash_ignores_layout() {
+        let a = "<ul><li>NVIDIA / auto-ontology</li><li>max-sxty / worktrunk</li></ul>";
+        let (text, hash_a) = normalize_and_hash(a, "", "").unwrap();
+        assert_eq!(text.lines().count(), 2);
+        let b = "<ul><li>NVIDIA / auto-ontology</li>\n\n<li>max-sxty / worktrunk</li></ul>";
+        let (_, hash_b) = normalize_and_hash(b, "", "").unwrap();
+        assert_eq!(hash_a, hash_b);
     }
 
     #[test]

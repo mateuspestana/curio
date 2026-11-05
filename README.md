@@ -47,7 +47,7 @@ Interface e mensagens em **português**. Dados em `~/.curio/curio.db`.
 
 Intervalos: `10s`, `50m`, `2h`, `2d`, `1w` (mínimo 5s).
 
-Detecção usa **texto visível normalizado**, com seletor CSS/XPath opcional e regex de linhas a ignorar. Em falha de rede/HTTP, Curió tenta de novo até 2 vezes com intervalo de **5 minutos**; se as 3 tentativas falharem, notifica downtime.
+Detecção usa **texto visível normalizado** (um item por linha: o histórico mostra só os itens que mudaram), com seletor CSS/XPath opcional e regex de linhas a ignorar. Em falha de rede/HTTP, Curió tenta de novo até 2 vezes com intervalo de **5 minutos**; se as 3 tentativas falharem, notifica downtime.
 
 ## Licença
 
