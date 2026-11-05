@@ -24,9 +24,9 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::collections::{HashMap, HashSet};
 use std::io::stdout;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let db_path = default_db_path()?;
     let _ = Database::open_path(&db_path)?;
@@ -40,8 +40,10 @@ async fn main() -> Result<()> {
     let mon_schedule = schedule.clone();
     let mon_reload = reload.clone();
     let mon_force = force.clone();
+    let wake = Arc::new(Notify::new());
+    let mon_wake = wake.clone();
     tokio::spawn(async move {
-        run_monitor(mon_path, tx, mon_schedule, mon_reload, mon_force).await;
+        run_monitor(mon_path, tx, mon_schedule, mon_reload, mon_force, mon_wake).await;
     });
 
     enable_raw_mode()?;
@@ -50,7 +52,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(db_path, schedule, reload, force, rx)?;
+    let mut app = App::new(db_path, schedule, reload, force, wake, rx)?;
     let result = app.run(&mut terminal).await;
 
     disable_raw_mode()?;

@@ -19,11 +19,20 @@ impl Database {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("criar diretório {}", parent.display()))?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("abrir banco {}", path.display()))?;
-        let db = Self { conn };
+        let db = Self::connect(path)?;
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Abre a conexão sem migrar: WAL + busy_timeout permitem UI e monitor
+    /// compartilharem o arquivo sem "database is locked".
+    pub fn connect(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)
+            .with_context(|| format!("abrir banco {}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        )?;
+        Ok(Self { conn })
     }
 
     #[cfg(test)]

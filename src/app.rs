@@ -9,7 +9,8 @@ use crate::monitor::{ForceCheckSet, ScheduleMap};
 use crate::ui::form::{FormField, FormState};
 use crate::ui::{alerts, dashboard, form, history, theme, widgets};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use futures_util::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
     widgets::{Block, Borders, Clear, Paragraph},
@@ -20,8 +21,13 @@ use std::io::Stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::Instant;
+
+#[derive(Default)]
+struct Reload {
+    alerts: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -34,7 +40,7 @@ enum Screen {
 }
 
 pub struct App {
-    db_path: PathBuf,
+    db: Database,
     watches: Vec<Watch>,
     selected: usize,
     screen: Screen,
@@ -49,6 +55,7 @@ pub struct App {
     schedule: ScheduleMap,
     reload: Arc<Mutex<bool>>,
     force: ForceCheckSet,
+    wake: Arc<Notify>,
     events: mpsc::UnboundedReceiver<AppEvent>,
     should_quit: bool,
 }
@@ -59,12 +66,14 @@ impl App {
         schedule: ScheduleMap,
         reload: Arc<Mutex<bool>>,
         force: ForceCheckSet,
+        wake: Arc<Notify>,
         events: mpsc::UnboundedReceiver<AppEvent>,
     ) -> Result<Self> {
-        let settings = Database::open_path(&db_path)?.load_settings()?;
+        let db = Database::open_path(&db_path)?;
+        let settings = db.load_settings()?;
         theme::set_mode(settings.theme);
         let mut app = Self {
-            db_path,
+            db,
             watches: Vec::new(),
             selected: 0,
             screen: Screen::Dashboard,
@@ -79,6 +88,7 @@ impl App {
             schedule,
             reload,
             force,
+            wake,
             events,
             should_quit: false,
         };
@@ -87,14 +97,13 @@ impl App {
         Ok(app)
     }
 
-    fn db(&self) -> Result<Database> {
-        Database::open_path(&self.db_path)
+    fn db(&self) -> Result<&Database> {
+        Ok(&self.db)
     }
 
     fn reload_watches(&mut self) -> Result<()> {
-        let db = self.db()?;
-        self.watches = db.list_watches()?;
-        self.unread_total = db.unread_count()?;
+        self.watches = self.db.list_watches()?;
+        self.unread_total = self.db.unread_count()?;
         if self.selected >= self.watches.len() && !self.watches.is_empty() {
             self.selected = self.watches.len() - 1;
         }
@@ -108,28 +117,64 @@ impl App {
 
     async fn request_reload(&self) {
         *self.reload.lock().await = true;
+        self.wake.notify_one();
     }
 
     async fn request_force_check(&self, id: i64) {
         self.force.lock().await.insert(id);
+        self.wake.notify_one();
     }
 
     pub async fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
+        let mut keys = EventStream::new();
+        // 1 Hz: só para a contagem regressiva do dashboard.
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut dirty = true;
+        let mut monitor_alive = true;
+
         while !self.should_quit {
-            while let Ok(ev) = self.events.try_recv() {
-                self.handle_app_event(ev)?;
+            if dirty {
+                let schedule_snapshot = self.schedule.lock().await.clone();
+                terminal.draw(|f| self.draw(f, &schedule_snapshot))?;
+                dirty = false;
             }
 
-            let schedule_snapshot = self.schedule.lock().await.clone();
-            terminal.draw(|f| self.draw(f, &schedule_snapshot))?;
-
-            if event::poll(Duration::from_millis(200))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        self.handle_key(key.code, key.modifiers).await?;
+            tokio::select! {
+                ev = keys.next() => match ev {
+                    Some(Ok(Event::Key(key))) => {
+                        if key.kind == KeyEventKind::Press {
+                            self.handle_key(key.code, key.modifiers).await?;
+                            dirty = true;
+                        }
+                    }
+                    Some(Ok(Event::Resize(..))) => dirty = true,
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e.into()),
+                    None => break,
+                },
+                ev = self.events.recv(), if monitor_alive => match ev {
+                    Some(ev) => {
+                        // Junta rajadas de eventos numa única recarga/redesenho.
+                        let mut reload = Reload::default();
+                        self.handle_app_event(ev, &mut reload);
+                        while let Ok(ev) = self.events.try_recv() {
+                            self.handle_app_event(ev, &mut reload);
+                        }
+                        self.reload_watches()?;
+                        if reload.alerts {
+                            self.reload_alerts()?;
+                        }
+                        dirty = true;
+                    }
+                    None => monitor_alive = false,
+                },
+                _ = ticker.tick() => {
+                    if matches!(self.screen, Screen::Dashboard | Screen::ConfirmDelete) {
+                        dirty = true;
                     }
                 }
             }
@@ -137,29 +182,24 @@ impl App {
         Ok(())
     }
 
-    fn handle_app_event(&mut self, ev: AppEvent) -> Result<()> {
+    fn handle_app_event(&mut self, ev: AppEvent, reload: &mut Reload) {
         match ev {
-            AppEvent::WatchUpdated(_) | AppEvent::Tick => {
-                self.reload_watches()?;
-            }
+            AppEvent::WatchUpdated(_) => {}
             AppEvent::ChangeDetected { label, .. } => {
-                self.flash.push(format!("Mudança detectada: {label}"));
-                if self.flash.len() > 30 {
-                    self.flash.remove(0);
-                }
-                self.reload_watches()?;
-                self.reload_alerts()?;
+                self.push_flash(format!("Mudança detectada: {label}"));
+                reload.alerts = true;
             }
             AppEvent::Downtime { label, error, .. } => {
-                self.flash
-                    .push(format!("Indisponível: {label} — {error}"));
-                if self.flash.len() > 30 {
-                    self.flash.remove(0);
-                }
-                self.reload_watches()?;
+                self.push_flash(format!("Indisponível: {label} — {error}"));
             }
         }
-        Ok(())
+    }
+
+    fn push_flash(&mut self, msg: String) {
+        self.flash.push(msg);
+        if self.flash.len() > 30 {
+            self.flash.remove(0);
+        }
     }
 
     fn draw(&self, frame: &mut ratatui::Frame, schedule: &HashMap<i64, Instant>) {

@@ -171,5 +171,4 @@ pub enum AppEvent {
     WatchUpdated(Watch),
     ChangeDetected { watch_id: i64, label: String },
     Downtime { watch_id: i64, label: String, error: String },
-    Tick,
 }
