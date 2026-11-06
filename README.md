@@ -1,5 +1,11 @@
 # Curió
 
+[![versão](https://img.shields.io/github/v/release/mateuspestana/curio?label=versão)](https://github.com/mateuspestana/curio/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/mateuspestana/curio/ci.yml?branch=main&label=CI)](https://github.com/mateuspestana/curio/actions/workflows/ci.yml)
+[![licença](https://img.shields.io/github/license/mateuspestana/curio?label=licença)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![atualizado](https://img.shields.io/github/last-commit/mateuspestana/curio?label=atualizado)](https://github.com/mateuspestana/curio/commits/main)
+
 TUI para monitorar mudanças em URLs — avisa na interface e no sistema, guarda histórico de diffs e abre o site no browser.
 
 **Autor:** Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
