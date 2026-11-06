@@ -1,6 +1,7 @@
 //! Extract and normalize visible text from HTML (optional CSS/XPath + ignore filters).
 //! Author: Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
 
+use crate::model::Mode;
 use regex::Regex;
 use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,10 @@ pub enum ExtractError {
     InvalidIgnoreRegex(String),
     #[error("seletor não encontrou elementos")]
     NoMatch,
+    #[error("resposta não é JSON válido: {0}")]
+    InvalidJson(String),
+    #[error("caminho JSON inválido: {0}")]
+    InvalidJsonPath(String),
 }
 
 /// Largura de renderização do texto usado no hash (histórico; não alterar, ou
@@ -43,10 +48,32 @@ pub fn normalize_and_hash(
     Ok((normalize_lines(&filtered_wide), hash))
 }
 
+/// Extrai texto + hash conforme o modo do monitor.
+///
+/// `Html` e `Js` (DOM já renderizado) usam o mesmo caminho de sempre; `Json`
+/// achata a resposta em uma linha `caminho: valor` por folha.
+pub fn extract(
+    body: &str,
+    mode: Mode,
+    selector: &str,
+    ignore_regex: &str,
+) -> Result<(String, String), ExtractError> {
+    match mode {
+        Mode::Html | Mode::Js => normalize_and_hash(body, selector, ignore_regex),
+        Mode::Json => {
+            let lines = crate::jsonq::extract_lines(body, selector)?;
+            let filtered = apply_ignore_filters(&lines, ignore_regex)?;
+            let hash = hash_text(&normalize_text(&filtered));
+            Ok((normalize_lines(&filtered), hash))
+        }
+    }
+}
+
 fn extract_raw_text(html: &str, selector: &str, width: usize) -> Result<String, ExtractError> {
     let sel = selector.trim();
     if sel.is_empty() {
-        let text = html2text::from_read(html.as_bytes(), width).unwrap_or_else(|_| html.to_string());
+        let text =
+            html2text::from_read(html.as_bytes(), width).unwrap_or_else(|_| html.to_string());
         return Ok(text);
     }
 
@@ -211,5 +238,18 @@ mod tests {
         let out = apply_ignore_filters(text, r"timestamp:").unwrap();
         assert!(out.contains("keep"));
         assert!(!out.contains("timestamp"));
+    }
+
+    /// Hash fixado com o código da v0.3.2: se mudar, todo monitor existente
+    /// registraria uma mudança falsa ao atualizar o Curió.
+    #[test]
+    fn default_html_hash_is_pinned() {
+        let html = "<html><body><h1>Curió</h1><ul><li>um / dois</li><li>três / quatro</li></ul><p>R$ 1.234,56</p></body></html>";
+        let (text, hash) = normalize_and_hash(html, "", "").unwrap();
+        assert_eq!(text, "# Curió\n* um / dois\n* três / quatro\nR$ 1.234,56");
+        assert_eq!(
+            hash,
+            "c27a5c423ff596dc75917894b486d062a931d2cbc7478b015adf43f139dfaacb"
+        );
     }
 }

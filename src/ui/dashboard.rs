@@ -2,7 +2,7 @@
 //! Author: Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
 
 use crate::interval::format_interval;
-use crate::model::{Density, Watch, WatchStatus};
+use crate::model::{Density, Mode, Watch, WatchStatus};
 use crate::ui::theme;
 use chrono::Local;
 use ratatui::{
@@ -15,17 +15,36 @@ use ratatui::{
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
+use unicode_width::UnicodeWidthStr;
 
-pub fn draw(
-    frame: &mut Frame,
-    area: Rect,
-    watches: &[Watch],
-    selected: usize,
-    schedule: &HashMap<i64, Instant>,
-    density: Density,
-    unread_total: u64,
-) {
+/// Tudo que o painel precisa para desenhar a lista de monitores.
+#[derive(Clone, Copy)]
+pub struct DashboardView<'a> {
+    pub watches: &'a [Watch],
+    pub selected: usize,
+    pub schedule: &'a HashMap<i64, Instant>,
+    pub density: Density,
+    pub unread_total: u64,
+    pub filter_note: &'a str,
+}
+
+pub fn draw(frame: &mut Frame, area: Rect, view: DashboardView) {
+    let DashboardView {
+        watches,
+        selected,
+        schedule,
+        density,
+        unread_total,
+        filter_note,
+    } = view;
     let compact = density == Density::Compact;
+    // Colunas fixas: o status alinha mesmo quando há tags e modo na linha.
+    let name_col = if compact { 28 } else { 36 };
+    let tags_col = match (watches.iter().any(|w| !w.tags.is_empty()), compact) {
+        (false, _) => 0,
+        (true, true) => 12,
+        (true, false) => 14,
+    };
     let items: Vec<ListItem> = watches
         .iter()
         .map(|w| {
@@ -57,20 +76,37 @@ pub fn draw(
             } else {
                 format!(" [{}]", truncate(&w.selector, 12))
             };
+            let mode_tag = match w.mode {
+                Mode::Html => String::new(),
+                m => format!(" ‹{}›", m.as_str()),
+            };
+            let tags: String = w.tag_list().map(|t| format!(" #{t}")).collect();
+            let fails = if w.consecutive_failures > 0 {
+                format!(" ×{}", w.consecutive_failures)
+            } else {
+                String::new()
+            };
             let err = w
                 .last_error
                 .as_deref()
                 .filter(|_| w.last_status == WatchStatus::Error && !w.paused)
-                .map(|e| format!(" · {e}"))
+                .map(|e| format!("{fails} · {e}"))
                 .unwrap_or_default();
 
             let mut spans = vec![
                 Span::styled(badge, theme::status_changed()),
                 Span::styled(paused, theme::status_paused()),
-                Span::styled(format!("{name}{sel:<1} "), theme::normal()),
+                Span::styled(
+                    pad_to(&format!("{name}{sel}{mode_tag}"), name_col),
+                    theme::normal(),
+                ),
+                Span::styled(pad_to(&tags, tags_col), theme::status_waiting()),
             ];
             if compact {
-                spans.push(Span::styled(format!("{status} {interval} {eta}"), status_style));
+                spans.push(Span::styled(
+                    format!("{status} {interval} {eta}"),
+                    status_style,
+                ));
             } else {
                 spans.extend([
                     Span::styled(format!("{status:<9} "), status_style),
@@ -95,10 +131,11 @@ pub fn draw(
         state.select(Some(selected.min(watches.len() - 1)));
     }
 
-    let title = if unread_total > 0 {
-        format!(" Monitores  ·  {unread_total} não lido(s) ")
-    } else {
-        " Monitores ".into()
+    let title = match (unread_total > 0, filter_note.is_empty()) {
+        (true, true) => format!(" Monitores  ·  {unread_total} não lido(s) "),
+        (true, false) => format!(" Monitores  ·  {unread_total} não lido(s)  ·  {filter_note} "),
+        (false, false) => format!(" Monitores  ·  {filter_note} "),
+        (false, true) => " Monitores ".into(),
     };
 
     let list = List::new(items)
@@ -160,6 +197,33 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Corta (com `…`) e completa com espaços até exatamente `width` colunas, sempre
+/// deixando ao menos um espaço no fim como separador (0 = sem coluna).
+fn pad_to(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let inner = width - 1;
+    let mut out = String::new();
+    let mut w = 0;
+    if s.width() <= inner {
+        out.push_str(s);
+        w = s.width();
+    } else {
+        for c in s.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > inner.saturating_sub(1) {
+                break;
+            }
+            out.push(c);
+            w += cw;
+        }
+        out.push('…');
+        w += 1;
+    }
+    format!("{out}{}", " ".repeat(width - w))
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let count = s.chars().count();
     if count <= max {
@@ -168,5 +232,21 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
         t.push('…');
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pad_to_makes_fixed_width_columns() {
+        assert_eq!(pad_to("abc", 6), "abc   ");
+        assert_eq!(pad_to("abc", 6).width(), 6);
+        assert_eq!(pad_to("", 0), "");
+        let cut = pad_to("um nome bem comprido demais", 10);
+        assert_eq!(cut.width(), 10);
+        assert!(cut.contains('…'));
+        assert_eq!(pad_to("ação", 8).width(), 8);
     }
 }

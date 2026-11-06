@@ -1,12 +1,18 @@
 //! Application state and TUI event loop.
 //! Author: Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
 
+use crate::condition::Condition;
 use crate::db::Database;
-use crate::extract::normalize_and_hash;
-use crate::interval::{format_interval, parse_interval};
-use crate::model::{AppEvent, AppSettings, Change, Watch};
+use crate::fetch::{build_client, fetch_and_extract, find_browser, Target};
+use crate::model::{AppEvent, AppSettings, Change, Mode, Watch};
 use crate::monitor::{ForceCheckSet, ScheduleMap};
+use crate::spec::WatchSpec;
+use crate::transfer::{
+    export_history, export_warnings, export_watches, write_file, ConfigFormat, HistoryFormat,
+};
+use crate::ui::dashboard::DashboardView;
 use crate::ui::form::{FormField, FormState};
+use crate::ui::history::DiffView;
 use crate::ui::{alerts, dashboard, form, history, theme, widgets};
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -21,6 +27,12 @@ use std::io::Stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+const NO_BROWSER_MSG: &str =
+    "modo js precisa de Chrome/Chromium/Brave/Edge (ou defina CURIO_CHROME com o caminho)";
+
+/// Quanto tempo uma mensagem passageira fica no rodapé.
+const TOAST_TTL: Duration = Duration::from_secs(6);
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::Instant;
 
@@ -41,8 +53,16 @@ enum Screen {
 
 pub struct App {
     db: Database,
+    /// Todos os monitores do banco.
+    all_watches: Vec<Watch>,
+    /// Monitores visíveis (após busca/tag). `selected` indexa ESTA lista, então
+    /// toda ação (excluir, pausar, editar…) atua no item que está na tela.
     watches: Vec<Watch>,
     selected: usize,
+    filter: String,
+    filtering: bool,
+    tag_filter: Option<String>,
+    toast: Option<(String, std::time::Instant)>,
     screen: Screen,
     form: FormState,
     changes: Vec<Change>,
@@ -74,8 +94,13 @@ impl App {
         theme::set_mode(settings.theme);
         let mut app = Self {
             db,
+            all_watches: Vec::new(),
             watches: Vec::new(),
             selected: 0,
+            filter: String::new(),
+            filtering: false,
+            tag_filter: None,
+            toast: None,
             screen: Screen::Dashboard,
             form: FormState::new_add(),
             changes: Vec::new(),
@@ -102,12 +127,101 @@ impl App {
     }
 
     fn reload_watches(&mut self) -> Result<()> {
-        self.watches = self.db.list_watches()?;
+        let keep = self.watches.get(self.selected).map(|w| w.id);
+        self.all_watches = self.db.list_watches()?;
         self.unread_total = self.db.unread_count()?;
-        if self.selected >= self.watches.len() && !self.watches.is_empty() {
-            self.selected = self.watches.len() - 1;
-        }
+        self.apply_filters(keep);
         Ok(())
+    }
+
+    /// Recalcula a lista visível; mantém a seleção no mesmo monitor (por id).
+    fn apply_filters(&mut self, keep: Option<i64>) {
+        if let Some(tag) = &self.tag_filter {
+            if !self
+                .all_watches
+                .iter()
+                .any(|w| w.tag_list().any(|t| t == tag))
+            {
+                self.tag_filter = None;
+            }
+        }
+        let needle = self.filter.trim().to_lowercase();
+        let tag = self.tag_filter.clone();
+        self.watches = self
+            .all_watches
+            .iter()
+            .filter(|w| tag.as_ref().is_none_or(|t| w.tag_list().any(|x| x == t)))
+            .filter(|w| {
+                needle.is_empty()
+                    || w.label.to_lowercase().contains(&needle)
+                    || w.url.to_lowercase().contains(&needle)
+                    || w.tags.contains(&needle)
+            })
+            .cloned()
+            .collect();
+        self.selected = keep
+            .and_then(|id| self.watches.iter().position(|w| w.id == id))
+            .unwrap_or(self.selected)
+            .min(self.watches.len().saturating_sub(1));
+    }
+
+    /// Etiqueta do filtro ativo para o título da lista.
+    fn filter_note(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(t) = &self.tag_filter {
+            parts.push(format!("tag #{t}"));
+        }
+        if self.filtering || !self.filter.is_empty() {
+            parts.push(format!(
+                "busca \"{}\"{}",
+                self.filter,
+                if self.filtering { "█" } else { "" }
+            ));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{} · {}/{}",
+                parts.join(" + "),
+                self.watches.len(),
+                self.all_watches.len()
+            )
+        }
+    }
+
+    fn cycle_tag_filter(&mut self) {
+        let mut tags: Vec<String> = self
+            .all_watches
+            .iter()
+            .flat_map(|w| w.tag_list().map(String::from))
+            .collect();
+        tags.sort();
+        tags.dedup();
+        self.tag_filter = match &self.tag_filter {
+            None => tags.first().cloned(),
+            Some(cur) => tags
+                .iter()
+                .position(|t| t == cur)
+                .and_then(|i| tags.get(i + 1))
+                .cloned(),
+        };
+        let keep = self.watches.get(self.selected).map(|w| w.id);
+        self.apply_filters(keep);
+    }
+
+    /// Mensagem no rodapé (some sozinha) e no painel de alertas.
+    fn say(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.toast = Some((msg.clone(), std::time::Instant::now()));
+        self.push_flash(msg);
+    }
+
+    fn active_toast(&self) -> Option<&str> {
+        self.toast
+            .as_ref()
+            .filter(|(_, t)| t.elapsed() < TOAST_TTL)
+            .map(|(m, _)| m.as_str())
     }
 
     fn reload_alerts(&mut self) -> Result<()> {
@@ -125,10 +239,7 @@ impl App {
         self.wake.notify_one();
     }
 
-    pub async fn run(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> Result<()> {
+    pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         let mut keys = EventStream::new();
         // 1 Hz: só para a contagem regressiva do dashboard.
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -176,6 +287,10 @@ impl App {
                     if matches!(self.screen, Screen::Dashboard | Screen::ConfirmDelete) {
                         dirty = true;
                     }
+                    if self.toast.as_ref().is_some_and(|(_, t)| t.elapsed() >= TOAST_TTL) {
+                        self.toast = None;
+                        dirty = true;
+                    }
                 }
             }
         }
@@ -186,11 +301,14 @@ impl App {
         match ev {
             AppEvent::WatchUpdated(_) => {}
             AppEvent::ChangeDetected { label, .. } => {
-                self.push_flash(format!("Mudança detectada: {label}"));
+                self.say(format!("Mudança detectada: {label}"));
                 reload.alerts = true;
             }
             AppEvent::Downtime { label, error, .. } => {
-                self.push_flash(format!("Indisponível: {label} — {error}"));
+                self.say(format!("Indisponível: {label} — {error}"));
+            }
+            AppEvent::Recovered { label, .. } => {
+                self.say(format!("Voltou ao ar: {label}"));
             }
         }
     }
@@ -222,11 +340,14 @@ impl App {
                 dashboard::draw(
                     frame,
                     body,
-                    &self.watches,
-                    self.selected,
-                    schedule,
-                    self.settings.density,
-                    self.unread_total,
+                    DashboardView {
+                        watches: &self.watches,
+                        selected: self.selected,
+                        schedule,
+                        density: self.settings.density,
+                        unread_total: self.unread_total,
+                        filter_note: &self.filter_note(),
+                    },
                 );
                 if self.screen == Screen::ConfirmDelete {
                     draw_modal(frame, body, "Excluir este monitor? [s] sim  [n] não");
@@ -246,35 +367,62 @@ impl App {
                     &self.changes,
                     self.change_selected,
                     self.diff_scroll,
+                    DiffView {
+                        context: self.settings.diff_context,
+                        side_by_side: self.settings.diff_side_by_side,
+                    },
                 );
             }
             Screen::Alerts => alerts::draw(frame, body, &self.alerts, &self.flash),
             Screen::Help => draw_help(frame, body),
         }
 
-        let theme_hint = match self.settings.theme {
-            crate::model::ThemeMode::Dark => "escuro",
-            crate::model::ThemeMode::Light => "claro",
-        };
-        let dens = match self.settings.density {
-            crate::model::Density::Normal => "normal",
-            crate::model::Density::Compact => "compacta",
-        };
-
+        let width = footer.width.saturating_sub(4) as usize;
         let hints = match self.screen {
-            Screen::Dashboard => format!(
-                "a add · e edit · d del · p pausar · r checar · o abrir · h hist · l alertas · m lidos · t tema({theme_hint}) · c dens({dens}) · ? · q"
+            Screen::Dashboard if self.filtering => {
+                format!("/{}█ · ↑↓ navega · Enter aceita · Esc limpa", self.filter)
+            }
+            Screen::Dashboard => widgets::fit_hints(
+                &[
+                    "a add",
+                    "e edit",
+                    "d del",
+                    "p pausa",
+                    "r checar",
+                    "h hist",
+                    "l alertas",
+                    "m lidos",
+                    "/ busca",
+                    "g tag",
+                    "o abrir",
+                    "x export",
+                    "t tema",
+                    "c dens",
+                ],
+                "? ajuda · q sair",
+                width,
             ),
-            Screen::Form => {
-                "Tab campo · v prévia · Enter salvar · Esc cancelar".into()
-            }
-            Screen::History => {
-                "↑↓ · PgUp/PgDn · m visto · Esc · o abrir".into()
-            }
+            Screen::Form => widgets::fit_hints(
+                &["Tab campo", "F5 prévia", "Enter salvar"],
+                "Esc cancelar",
+                width,
+            ),
+            Screen::History => widgets::fit_hints(
+                &[
+                    "↑↓",
+                    "c contexto",
+                    "s lado a lado",
+                    "x exportar",
+                    "m visto",
+                    "o abrir",
+                ],
+                "Esc voltar",
+                width,
+            ),
             Screen::Alerts => "m marcar todos vistos · Esc voltar".into(),
             Screen::Help | Screen::ConfirmDelete => "Esc voltar".into(),
         };
-        widgets::draw_footer(frame, footer, &hints);
+        widgets::draw_footer(frame, footer, &hints, self.active_toast());
     }
 
     async fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<()> {
@@ -285,7 +433,7 @@ impl App {
 
         match self.screen {
             Screen::Dashboard => self.key_dashboard(code).await?,
-            Screen::Form => self.key_form(code).await?,
+            Screen::Form => self.key_form(code, mods).await?,
             Screen::History => self.key_history(code).await?,
             Screen::Alerts => self.key_alerts(code)?,
             Screen::Help => {
@@ -298,8 +446,57 @@ impl App {
         Ok(())
     }
 
-    async fn key_dashboard(&mut self, code: KeyCode) -> Result<()> {
+    /// Edição da busca (`/`): atualiza a lista a cada tecla.
+    fn key_filtering(&mut self, code: KeyCode) {
+        let keep = self.watches.get(self.selected).map(|w| w.id);
         match code {
+            KeyCode::Enter => self.filtering = false,
+            KeyCode::Esc => {
+                self.filter.clear();
+                self.filtering = false;
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+            }
+            KeyCode::Char(c) if !c.is_control() => self.filter.push(c),
+            KeyCode::Down if !self.watches.is_empty() => {
+                self.selected = (self.selected + 1) % self.watches.len();
+                return;
+            }
+            KeyCode::Up if !self.watches.is_empty() => {
+                self.selected = self
+                    .selected
+                    .checked_sub(1)
+                    .unwrap_or(self.watches.len() - 1);
+                return;
+            }
+            _ => return,
+        }
+        self.apply_filters(keep);
+    }
+
+    async fn key_dashboard(&mut self, code: KeyCode) -> Result<()> {
+        if self.filtering {
+            self.key_filtering(code);
+            return Ok(());
+        }
+        match code {
+            KeyCode::Char('/') => self.filtering = true,
+            KeyCode::Char('g') => {
+                self.cycle_tag_filter();
+                let msg = match &self.tag_filter {
+                    Some(t) => format!("Filtrando pela tag #{t}"),
+                    None => "Mostrando todas as tags".into(),
+                };
+                self.say(msg);
+            }
+            KeyCode::Char('x') => self.export_monitors(),
+            KeyCode::Esc if !self.filter.is_empty() || self.tag_filter.is_some() => {
+                self.filter.clear();
+                self.tag_filter = None;
+                let keep = self.watches.get(self.selected).map(|w| w.id);
+                self.apply_filters(keep);
+            }
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.screen = Screen::Help,
             KeyCode::Char('a') => {
@@ -307,15 +504,8 @@ impl App {
                 self.screen = Screen::Form;
             }
             KeyCode::Char('e') => {
-                if let Some(w) = self.watches.get(self.selected).cloned() {
-                    self.form = FormState::new_edit(
-                        w.id,
-                        w.url,
-                        w.label,
-                        format_interval(w.interval_secs),
-                        w.selector,
-                        w.ignore_regex,
-                    );
+                if let Some(w) = self.watches.get(self.selected) {
+                    self.form = FormState::from_spec(Some(w.id), &WatchSpec::from_watch(w));
                     self.screen = Screen::Form;
                 }
             }
@@ -333,7 +523,7 @@ impl App {
                     self.db()?.set_paused(id, new_paused)?;
                     self.reload_watches()?;
                     self.request_reload().await;
-                    self.flash.push(if new_paused {
+                    self.say(if new_paused {
                         format!("Pausado: {name}")
                     } else {
                         format!("Retomado: {name}")
@@ -347,7 +537,7 @@ impl App {
                     .map(|w| (w.id, w.display_name().to_string()));
                 if let Some((id, name)) = force {
                     self.request_force_check(id).await;
-                    self.flash.push(format!("Checando agora: {name}"));
+                    self.say(format!("Checando agora: {name}"));
                 }
             }
             KeyCode::Char('o') => {
@@ -379,8 +569,7 @@ impl App {
                 }
                 self.reload_watches()?;
                 self.reload_alerts()?;
-                self.flash
-                    .push("Marcado como lido.".into());
+                self.say("Marcado como lido.");
             }
             KeyCode::Char('t') => {
                 self.settings.theme = self.settings.theme.toggle();
@@ -396,53 +585,64 @@ impl App {
                     self.selected = (self.selected + 1) % self.watches.len();
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if !self.watches.is_empty() {
-                    self.selected = if self.selected == 0 {
-                        self.watches.len() - 1
-                    } else {
-                        self.selected - 1
-                    };
-                }
+            KeyCode::Up | KeyCode::Char('k') if !self.watches.is_empty() => {
+                self.selected = self
+                    .selected
+                    .checked_sub(1)
+                    .unwrap_or(self.watches.len() - 1);
             }
             _ => {}
         }
         Ok(())
     }
 
-    async fn key_form(&mut self, code: KeyCode) -> Result<()> {
+    async fn key_form(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<()> {
         if self.form.preview.is_some() {
             match code {
                 KeyCode::Esc | KeyCode::Char('v') => {
                     self.form.preview = None;
                     self.form.preview_scroll = 0;
                 }
-                KeyCode::PageDown => self.form.preview_scroll = self.form.preview_scroll.saturating_add(5),
-                KeyCode::PageUp => self.form.preview_scroll = self.form.preview_scroll.saturating_sub(5),
+                KeyCode::PageDown => {
+                    self.form.preview_scroll = self.form.preview_scroll.saturating_add(5)
+                }
+                KeyCode::PageUp => {
+                    self.form.preview_scroll = self.form.preview_scroll.saturating_sub(5)
+                }
                 _ => {}
             }
             return Ok(());
         }
 
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
         match code {
             KeyCode::Esc => self.screen = Screen::Dashboard,
             KeyCode::Tab | KeyCode::Down => self.form.next_field(),
             KeyCode::BackTab | KeyCode::Up => self.form.prev_field(),
             KeyCode::F(5) => self.run_preview().await?,
-            KeyCode::Char('v')
-                if matches!(
-                    self.form.focus,
-                    FormField::Url | FormField::Label | FormField::Interval
-                ) =>
-            {
-                self.run_preview().await?;
-            }
             KeyCode::Enter => self.submit_form().await?,
-            KeyCode::Backspace => {
-                self.form.focused_mut().pop();
+            KeyCode::Char('n') if ctrl => {
+                if self.form.focus.is_multiline() {
+                    if let Some(buf) = self.form.focused_mut() {
+                        buf.push('\n');
+                    }
+                }
             }
-            KeyCode::Char(c) if !c.is_control() => {
-                self.form.focused_mut().push(c);
+            KeyCode::Left if self.form.focus == FormField::Mode => {
+                self.form.mode = self.form.mode.prev()
+            }
+            KeyCode::Right | KeyCode::Char(' ') if self.form.focus == FormField::Mode => {
+                self.form.mode = self.form.mode.next()
+            }
+            KeyCode::Backspace => {
+                if let Some(buf) = self.form.focused_mut() {
+                    buf.pop();
+                }
+            }
+            KeyCode::Char(c) if !ctrl && !c.is_control() => {
+                if let Some(buf) = self.form.focused_mut() {
+                    buf.push(c);
+                }
             }
             _ => {}
         }
@@ -451,93 +651,75 @@ impl App {
 
     async fn run_preview(&mut self) -> Result<()> {
         self.form.error = None;
-        let url = self.form.url.trim();
+        let url = self.form.url.trim().to_string();
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             self.form.error = Some("URL inválida para prévia".into());
+            self.form.focus = FormField::Url;
             return Ok(());
         }
-        let client = reqwest::Client::builder()
-            .user_agent("Curio/0.2 (+MACAPE)")
-            .timeout(Duration::from_secs(15))
-            .build()?;
-        let resp = client.get(url).send().await;
-        match resp {
-            Ok(r) if r.status().is_success() => match r.text().await {
-                Ok(html) => match normalize_and_hash(&html, &self.form.selector, &self.form.ignore_regex)
-                {
-                    Ok((text, hash)) => {
-                        let preview = if text.is_empty() {
-                            "(vazio após normalização/filtros)".into()
-                        } else {
-                            format!("hash: {hash}\n\n{text}")
-                        };
-                        self.form.preview = Some(preview);
-                        self.form.preview_scroll = 0;
-                    }
-                    Err(e) => self.form.error = Some(e.to_string()),
-                },
-                Err(e) => self.form.error = Some(format!("ler corpo: {e}")),
-            },
-            Ok(r) => self.form.error = Some(format!("HTTP {}", r.status())),
-            Err(e) => self.form.error = Some(format!("rede: {e}")),
+        if self.form.mode == Mode::Js && find_browser().is_none() {
+            self.form.error = Some(NO_BROWSER_MSG.into());
+            self.form.focus = FormField::Mode;
+            return Ok(());
+        }
+        let target = Target {
+            url,
+            mode: self.form.mode,
+            selector: self.form.selector.trim().to_string(),
+            ignore_regex: self.form.ignore_regex.clone(),
+            headers: self.form.headers.clone(),
+        };
+        // Mesma pipeline do monitor: modo, cabeçalhos e extração idênticos.
+        match fetch_and_extract(&build_client(), &target).await {
+            Ok(ex) => {
+                let mut preview = String::new();
+                match Condition::parse(&self.form.condition) {
+                    Ok(c) if c.is_empty() => {}
+                    Ok(c) => preview.push_str(if c.matches(&ex.text) {
+                        "condição: ATENDE agora (alerta quando passar de \"não atende\" para \"atende\")\n"
+                    } else {
+                        "condição: NÃO atende agora\n"
+                    }),
+                    Err(e) => preview.push_str(&format!("condição inválida: {e}\n")),
+                }
+                if ex.text.is_empty() {
+                    preview.push_str("(vazio após normalização/filtros)");
+                } else {
+                    preview.push_str(&format!("hash: {}\n\n{}", ex.hash, ex.text));
+                }
+                self.form.preview = Some(preview);
+                self.form.preview_scroll = 0;
+            }
+            Err(e) => self.form.error = Some(e.message),
         }
         Ok(())
     }
 
     async fn submit_form(&mut self) -> Result<()> {
         self.form.error = None;
-        let url = self.form.url.trim().to_string();
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            self.form.error = Some("URL deve começar com http:// ou https://".into());
-            self.form.focus = FormField::Url;
-            return Ok(());
-        }
-        let interval = match parse_interval(&self.form.interval) {
-            Ok(v) => v,
-            Err(e) => {
-                self.form.error = Some(e.to_string());
-                self.form.focus = FormField::Interval;
+        let spec = match self.form.to_spec() {
+            Ok(spec) => spec,
+            Err((field, msg)) => {
+                self.form.error = Some(msg);
+                self.form.focus = field;
                 return Ok(());
             }
         };
-        // Validate selector / ignore by dry-run on empty html only for regex compile
-        if let Err(e) = normalize_and_hash(
-            "<html><body>teste</body></html>",
-            "",
-            &self.form.ignore_regex,
-        ) {
-            self.form.error = Some(e.to_string());
-            self.form.focus = FormField::IgnoreRegex;
+        if let Err(e) = spec.validate() {
+            self.form.error = Some(e.message);
+            self.form.focus = e.field.into();
             return Ok(());
         }
-        if !self.form.selector.trim().is_empty() {
-            if let Err(e) = normalize_and_hash(
-                "<html><body><div id=\"x\">ok</div></body></html>",
-                self.form.selector.trim(),
-                "",
-            ) {
-                // NoMatch is ok for validation of CSS syntax on sample; InvalidCss is not
-                if !matches!(e, crate::extract::ExtractError::NoMatch) {
-                    // XPath unsupported or invalid css
-                    if matches!(e, crate::extract::ExtractError::InvalidCss(_))
-                        || matches!(e, crate::extract::ExtractError::XPathUnsupported)
-                    {
-                        self.form.error = Some(e.to_string());
-                        self.form.focus = FormField::Selector;
-                        return Ok(());
-                    }
-                }
-            }
+        if spec.mode == Mode::Js && find_browser().is_none() {
+            self.form.error = Some(NO_BROWSER_MSG.into());
+            self.form.focus = FormField::Mode;
+            return Ok(());
         }
 
-        let label = self.form.label.trim().to_string();
-        let selector = self.form.selector.trim().to_string();
-        let ignore_regex = self.form.ignore_regex.clone();
-        let db = self.db()?;
         if let Some(id) = self.form.editing_id {
-            db.update_watch(id, &url, &label, interval, &selector, &ignore_regex)?;
+            self.db.update_watch(id, &spec)?;
         } else {
-            db.insert_watch(&url, &label, interval, &selector, &ignore_regex)?;
+            self.db.insert_watch(&spec)?;
         }
         self.reload_watches()?;
         self.request_reload().await;
@@ -555,11 +737,23 @@ impl App {
             }
             KeyCode::Char('m') => {
                 if let Some(w) = self.watches.get(self.selected) {
-                    self.db()?.mark_changes_seen_for_watch(w.id)?;
-                    self.changes = self.db()?.list_changes(w.id, 100)?;
+                    let id = w.id;
+                    self.db.mark_changes_seen_for_watch(id)?;
+                    self.changes = self.db.list_changes(id, 100)?;
                     self.reload_watches()?;
                 }
             }
+            KeyCode::Char('c') => {
+                self.settings.diff_context = !self.settings.diff_context;
+                self.db.save_settings(&self.settings)?;
+                self.diff_scroll = 0;
+            }
+            KeyCode::Char('s') => {
+                self.settings.diff_side_by_side = !self.settings.diff_side_by_side;
+                self.db.save_settings(&self.settings)?;
+                self.diff_scroll = 0;
+            }
+            KeyCode::Char('x') => self.export_selected_history(),
             KeyCode::Down | KeyCode::Char('j') => {
                 if !self.changes.is_empty() {
                     self.change_selected = (self.change_selected + 1) % self.changes.len();
@@ -568,11 +762,10 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if !self.changes.is_empty() {
-                    self.change_selected = if self.change_selected == 0 {
-                        self.changes.len() - 1
-                    } else {
-                        self.change_selected - 1
-                    };
+                    self.change_selected = self
+                        .change_selected
+                        .checked_sub(1)
+                        .unwrap_or(self.changes.len() - 1);
                     self.diff_scroll = 0;
                 }
             }
@@ -581,6 +774,55 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// `~/.curio/exports` (ou ao lado do banco indicado em `CURIO_DB`).
+    fn export_dir() -> Result<PathBuf> {
+        let dir = crate::db::data_dir()?.join("exports");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    fn export_monitors(&mut self) {
+        let result = (|| -> Result<(PathBuf, usize)> {
+            let watches = self.db.list_watches()?;
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let path = Self::export_dir()?.join(format!("monitores-{stamp}.toml"));
+            // Pode conter cabeçalhos: arquivo só do usuário.
+            write_file(&path, &export_watches(&watches, ConfigFormat::Toml)?, true)?;
+            Ok((path, export_warnings(&watches).len()))
+        })();
+        match result {
+            Ok((path, 0)) => self.say(format!("Monitores exportados: {}", path.display())),
+            Ok((path, n)) => self.say(format!(
+                "Exportado: {} (aviso: {n} cabeçalho(s) com valor literal; prefira ${{VAR}})",
+                path.display()
+            )),
+            Err(e) => self.say(format!("Falha ao exportar: {e}")),
+        }
+    }
+
+    fn export_selected_history(&mut self) {
+        let Some(id) = self.watches.get(self.selected).map(|w| w.id) else {
+            return;
+        };
+        let result = (|| -> Result<PathBuf> {
+            let rows = self.db.list_changes_for_export(Some(id))?;
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let dir = Self::export_dir()?;
+            for format in [HistoryFormat::Csv, HistoryFormat::Markdown] {
+                let path = dir.join(format!("historico-{id}-{stamp}.{}", format.extension()));
+                write_file(&path, &export_history(&rows, format), false)?;
+            }
+            Ok(dir)
+        })();
+        match result {
+            Ok(dir) => self.say(format!(
+                "Histórico exportado (CSV e MD) em {}",
+                dir.display()
+            )),
+            Err(e) => self.say(format!("Falha ao exportar: {e}")),
+        }
     }
 
     fn key_alerts(&mut self, code: KeyCode) -> Result<()> {
@@ -616,8 +858,9 @@ impl App {
 }
 
 fn draw_help(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-    let text = "\
-Curió v0.2 — atalhos
+    let text = format!(
+        "\
+Curió v{} — atalhos
 
   a          adicionar monitor
   e          editar selecionado
@@ -626,17 +869,30 @@ Curió v0.2 — atalhos
   r          checar agora
   o          abrir URL no navegador
   h          histórico / diferenças
+  /          buscar (rótulo, URL ou tag) · Enter aceita · Esc limpa
+  g          filtrar por tag (repita para passar à próxima)
+  x          exportar monitores (TOML) · no histórico: exporta CSV e Markdown
   l          painel de alertas
   m          marcar lido (selecionado ou todos)
   t          alternar tema claro/escuro
   c          densidade normal/compacta
-  v / F5     prévia do texto (no formulário)
   ?          esta ajuda
   q          sair
 
-Seletor: CSS (#id, .classe) ou XPath comum (//*[@id='x']).
-Ignorar: uma regex por linha; linhas casadas saem da comparação.
-";
+Formulário: Tab/Shift+Tab muda de campo · F5 prévia · Ctrl+N nova linha
+  Modo       html (padrão) · json (API) · js (renderiza JavaScript com Chrome/Chromium)
+  Seletor    CSS/XPath comum — ou, no modo json, caminho como items[*].price
+  Ignorar    uma regex por linha; linhas casadas saem da comparação
+  Alertar só se…  contém: x · não contém: x · regex: x · número < 100
+             (alerta quando passa de falso para verdadeiro; o histórico guarda tudo)
+  Cabeçalhos Nome: valor · use ${{VAR}} para segredos (lidos do ambiente)
+  Tags       separadas por vírgula
+
+Histórico: c contexto · s lado a lado · x exportar
+CLI: curio export · import · history · config · prune (curio --help)
+",
+        env!("CARGO_PKG_VERSION")
+    );
     let p = Paragraph::new(text).style(theme::normal()).block(
         Block::default()
             .title(" Ajuda ")

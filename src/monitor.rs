@@ -1,18 +1,19 @@
-//! Async URL monitor with retry policy, pause, and force-check.
+//! Async URL monitor with backoff, pause, force-check, conditions and retention.
 //! Author: Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
 
+use crate::condition::Condition;
 use crate::db::Database;
-use crate::diff::unified_diff;
-use crate::extract::normalize_and_hash;
+use crate::diff::{diff_with_context, CONTEXT_LINES};
+use crate::fetch::{build_client, fetch_and_extract, Target};
 use crate::model::{
-    AppEvent, WatchStatus, FETCH_TIMEOUT_SECS, MAX_FETCH_ATTEMPTS, RETRY_INTERVAL_SECS,
+    AppEvent, Watch, WatchStatus, MAX_BACKOFF_SECS, MAX_FETCH_ATTEMPTS, RETRY_BASE_SECS,
 };
-use crate::notify::{notify_change, notify_downtime};
-use anyhow::Result;
+use crate::notify::{notify_change, notify_downtime, notify_recovery};
+use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
@@ -25,6 +26,18 @@ pub type ForceCheckSet = Arc<Mutex<HashSet<i64>>>;
 
 /// Máximo de URLs buscadas ao mesmo tempo.
 const MAX_CONCURRENT_CHECKS: usize = 4;
+/// Intervalo entre limpezas de retenção (e VACUUM, se algo foi apagado).
+const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Espera após a `failures`-ésima falha seguida: 60s, 120s, 240s… até 1h, nunca
+/// menos que o `Retry-After` pedido pelo servidor.
+pub fn failure_delay_secs(failures: u32, retry_after: Option<u64>) -> u64 {
+    let shift = failures.saturating_sub(1).min(16);
+    let backoff = RETRY_BASE_SECS
+        .saturating_mul(1u64 << shift)
+        .min(MAX_BACKOFF_SECS);
+    backoff.max(retry_after.unwrap_or(0))
+}
 
 pub async fn run_monitor(
     db_path: PathBuf,
@@ -34,15 +47,7 @@ pub async fn run_monitor(
     force: ForceCheckSet,
     wake: Arc<Notify>,
 ) {
-    let client = Client::builder()
-        .user_agent(concat!(
-            "Curio/",
-            env!("CARGO_PKG_VERSION"),
-            " (+MACAPE; https://github.com/mateuspestana/curio)"
-        ))
-        .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .build()
-        .expect("http client");
+    let client = build_client();
 
     // Uma única conexão (migrada) para listar monitores; cada checagem abre a sua.
     let db = loop {
@@ -56,8 +61,15 @@ pub async fn run_monitor(
     };
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CHECKS));
     let mut due: HashMap<i64, Instant> = HashMap::new();
+    let mut next_prune = Instant::now();
 
     loop {
+        if Instant::now() >= next_prune {
+            let path = db_path.clone();
+            let _ = tokio::task::spawn_blocking(move || run_prune(&path)).await;
+            next_prune = Instant::now() + PRUNE_EVERY;
+        }
+
         {
             let mut flag = reload.lock().await;
             if *flag {
@@ -118,17 +130,25 @@ pub async fn run_monitor(
         *schedule.lock().await = due.clone();
 
         // Dorme até o próximo vencimento; reload/forçar/pausar acordam na hora.
-        let next = due.values().min().copied();
-        match next {
-            Some(t) => {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(t) => {}
-                    _ = wake.notified() => {}
-                }
-            }
-            None => wake.notified().await,
+        let next = due
+            .values()
+            .min()
+            .copied()
+            .map_or(next_prune, |t| t.min(next_prune));
+        tokio::select! {
+            _ = tokio::time::sleep_until(next) => {}
+            _ = wake.notified() => {}
         }
     }
+}
+
+/// Retenção do histórico; só faz VACUUM se algo foi apagado.
+fn run_prune(path: &Path) -> Result<()> {
+    let db = Database::connect(path)?;
+    if db.prune()? > 0 {
+        db.vacuum()?;
+    }
+    Ok(())
 }
 
 fn handle_outcome(
@@ -138,14 +158,26 @@ fn handle_outcome(
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
     match result {
-        CheckOutcome::Ok { watch, changed } => {
+        CheckOutcome::Ok {
+            watch,
+            alert,
+            recovered,
+            ..
+        } => {
             due.insert(
                 watch.id,
                 Instant::now() + std::time::Duration::from_secs(watch.interval_secs),
             );
-            let _ = tx.send(AppEvent::WatchUpdated(watch.clone()));
-            if changed {
-                let label = display_label(&watch.label, &watch.url);
+            let label = display_label(&watch.label, &watch.url);
+            let _ = tx.send(AppEvent::WatchUpdated(watch.id));
+            if recovered {
+                notify_recovery(&watch.label, &watch.url);
+                let _ = tx.send(AppEvent::Recovered {
+                    watch_id: watch.id,
+                    label: label.clone(),
+                });
+            }
+            if alert {
                 let _ = tx.send(AppEvent::ChangeDetected {
                     watch_id: watch.id,
                     label,
@@ -153,26 +185,26 @@ fn handle_outcome(
                 notify_change(&watch.label, &watch.url);
             }
         }
-        CheckOutcome::Retry { watch } => {
+        CheckOutcome::Failed {
+            watch,
+            error,
+            delay_secs,
+            notify_down,
+        } => {
             due.insert(
                 watch.id,
-                Instant::now() + std::time::Duration::from_secs(RETRY_INTERVAL_SECS),
+                Instant::now() + std::time::Duration::from_secs(delay_secs),
             );
-            let _ = tx.send(AppEvent::WatchUpdated(watch));
-        }
-        CheckOutcome::Downtime { watch, error } => {
-            due.insert(
-                watch.id,
-                Instant::now() + std::time::Duration::from_secs(watch.interval_secs),
-            );
-            let label = display_label(&watch.label, &watch.url);
-            notify_downtime(&watch.label, &watch.url, &error);
-            let _ = tx.send(AppEvent::Downtime {
-                watch_id: watch.id,
-                label,
-                error,
-            });
-            let _ = tx.send(AppEvent::WatchUpdated(watch));
+            if notify_down {
+                let label = display_label(&watch.label, &watch.url);
+                notify_downtime(&watch.label, &watch.url, &error);
+                let _ = tx.send(AppEvent::Downtime {
+                    watch_id: watch.id,
+                    label,
+                    error,
+                });
+            }
+            let _ = tx.send(AppEvent::WatchUpdated(watch.id));
         }
         CheckOutcome::SkippedPaused => {
             due.remove(&id);
@@ -185,20 +217,29 @@ fn handle_outcome(
 }
 
 enum CheckOutcome {
-    Ok { watch: crate::model::Watch, changed: bool },
-    Retry { watch: crate::model::Watch },
-    Downtime { watch: crate::model::Watch, error: String },
+    Ok {
+        watch: Watch,
+        /// O texto mudou desde o último snapshot.
+        #[allow(dead_code)]
+        changed: bool,
+        /// A mudança atende à condição: notificar e marcar como não lida.
+        alert: bool,
+        /// Voltou a responder depois de um downtime já avisado.
+        recovered: bool,
+    },
+    Failed {
+        watch: Watch,
+        error: String,
+        delay_secs: u64,
+        /// Primeira vez que atinge o limite de falhas (avisa uma só vez).
+        notify_down: bool,
+    },
     SkippedPaused,
     Fatal(anyhow::Error),
 }
 
-async fn check_watch(
-    client: &Client,
-    db_path: &PathBuf,
-    watch_id: i64,
-    force: bool,
-) -> CheckOutcome {
-    let db = match connect_db(db_path) {
+async fn check_watch(client: &Client, db_path: &Path, watch_id: i64, force: bool) -> CheckOutcome {
+    let db = match Database::connect(db_path) {
         Ok(d) => d,
         Err(e) => return CheckOutcome::Fatal(e),
     };
@@ -212,135 +253,87 @@ async fn check_watch(
         return CheckOutcome::SkippedPaused;
     }
 
-    let fetch = client.get(&watch.url).send().await;
-    let body = match fetch {
-        Ok(resp) => {
-            let status = resp.status();
-            if !status.is_success() {
-                Err(format!("HTTP {status}"))
-            } else {
-                resp.text()
-                    .await
-                    .map_err(|e| format!("ler corpo: {e}"))
-            }
-        }
-        Err(e) => Err(format!("rede: {e}")),
+    let outcome = match fetch_and_extract(client, &Target::from_watch(&watch)).await {
+        Ok(ex) => record_success(&db, &watch, &ex.text, &ex.hash),
+        Err(err) => record_failure(&db, &watch, &err.message, err.retry_after_secs),
     };
+    outcome.unwrap_or_else(CheckOutcome::Fatal)
+}
 
-    match body {
-        Ok(html) => {
-            let (text, hash) = match normalize_and_hash(&html, &watch.selector, &watch.ignore_regex)
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if let Err(err) =
-                        db.update_watch_check(watch_id, WatchStatus::Error, Some(&msg), 0, None)
-                    {
-                        return CheckOutcome::Fatal(err);
-                    }
-                    let updated = match db.get_watch(watch_id) {
-                        Ok(Some(w)) => w,
-                        Ok(None) => return CheckOutcome::Fatal(anyhow::anyhow!("watch removido")),
-                        Err(err) => return CheckOutcome::Fatal(err),
-                    };
-                    return CheckOutcome::Downtime {
-                        watch: updated,
-                        error: msg,
-                    };
-                }
-            };
+fn record_success(db: &Database, watch: &Watch, text: &str, hash: &str) -> Result<CheckOutcome> {
+    let id = watch.id;
+    let mut changed = false;
+    let mut alert = false;
 
-            let prev = match db.latest_snapshot(watch_id) {
-                Ok(s) => s,
-                Err(e) => return CheckOutcome::Fatal(e),
-            };
-
-            let mut changed = false;
-            match prev {
-                None => {
-                    if let Err(e) = db.insert_snapshot(watch_id, &hash, &text) {
-                        return CheckOutcome::Fatal(e);
-                    }
-                    if let Err(e) =
-                        db.update_watch_check(watch_id, WatchStatus::Ok, None, 0, Some(false))
-                    {
-                        return CheckOutcome::Fatal(e);
-                    }
-                }
-                Some(prev) if prev.content_hash == hash => {
-                    if let Err(e) = db.update_watch_check(watch_id, WatchStatus::Ok, None, 0, None)
-                    {
-                        return CheckOutcome::Fatal(e);
-                    }
-                }
-                Some(prev) => {
-                    let diff = unified_diff(&prev.normalized_text, &text);
-                    if let Err(e) = db.insert_snapshot(watch_id, &hash, &text) {
-                        return CheckOutcome::Fatal(e);
-                    }
-                    if let Err(e) = db.insert_change(watch_id, &diff) {
-                        return CheckOutcome::Fatal(e);
-                    }
-                    if let Err(e) =
-                        db.update_watch_check(watch_id, WatchStatus::Changed, None, 0, Some(true))
-                    {
-                        return CheckOutcome::Fatal(e);
-                    }
-                    changed = true;
-                }
-            }
-
-            if watch.paused {
-                let _ = db.set_paused(watch_id, true);
-            }
-
-            match db.get_watch(watch_id) {
-                Ok(Some(w)) => CheckOutcome::Ok { watch: w, changed },
-                Ok(None) => CheckOutcome::Fatal(anyhow::anyhow!("watch removido")),
-                Err(e) => CheckOutcome::Fatal(e),
-            }
+    match db.latest_snapshot(id)? {
+        None => {
+            db.insert_snapshot(id, hash, text)?;
+            db.update_watch_check(id, WatchStatus::Ok, None, 0, Some(false))?;
         }
-        Err(error) => {
-            let failures = watch.consecutive_failures.saturating_add(1);
-            if let Err(e) =
-                db.update_watch_check(watch_id, WatchStatus::Error, Some(&error), failures, None)
-            {
-                return CheckOutcome::Fatal(e);
-            }
-            let updated = match db.get_watch(watch_id) {
-                Ok(Some(w)) => w,
-                Ok(None) => return CheckOutcome::Fatal(anyhow::anyhow!("watch removido")),
-                Err(e) => return CheckOutcome::Fatal(e),
-            };
-
-            if failures < MAX_FETCH_ATTEMPTS {
-                CheckOutcome::Retry { watch: updated }
+        Some(prev) if prev.content_hash == hash => {
+            db.update_watch_check(id, WatchStatus::Ok, None, 0, None)?;
+        }
+        Some(prev) => {
+            let diff = diff_with_context(&prev.normalized_text, text, CONTEXT_LINES);
+            // Condição inválida no banco não pode silenciar o monitor: alerta sempre.
+            let condition = Condition::parse(&watch.condition).unwrap_or_default();
+            alert = condition.should_alert(&prev.normalized_text, text);
+            db.insert_snapshot(id, hash, text)?;
+            // O diff sempre vai para o histórico; a condição só decide o alerta.
+            db.insert_change(id, &diff, !alert)?;
+            let status = if alert {
+                WatchStatus::Changed
             } else {
-                let _ = db.update_watch_check(
-                    watch_id,
-                    WatchStatus::Error,
-                    Some(&error),
-                    0,
-                    None,
-                );
-                let updated = db.get_watch(watch_id).ok().flatten().unwrap_or(updated);
-                CheckOutcome::Downtime {
-                    watch: updated,
-                    error,
-                }
-            }
+                WatchStatus::Ok
+            };
+            db.update_watch_check(id, status, None, 0, alert.then_some(true))?;
+            changed = true;
         }
     }
+
+    let recovered = watch.down_since.is_some();
+    if recovered {
+        db.set_down_since(id, None)?;
+    }
+    if watch.paused {
+        db.set_paused(id, true)?;
+    }
+
+    let watch = db.get_watch(id)?.context("watch removido")?;
+    Ok(CheckOutcome::Ok {
+        watch,
+        changed,
+        alert,
+        recovered,
+    })
 }
 
-fn open_db(path: &PathBuf) -> Result<Database> {
+fn record_failure(
+    db: &Database,
+    watch: &Watch,
+    error: &str,
+    retry_after: Option<u64>,
+) -> Result<CheckOutcome> {
+    let id = watch.id;
+    // A contagem não zera ao avisar: o backoff continua crescendo enquanto estiver fora.
+    let failures = watch.consecutive_failures.saturating_add(1);
+    db.update_watch_check(id, WatchStatus::Error, Some(error), failures, None)?;
+
+    let notify_down = failures >= MAX_FETCH_ATTEMPTS && watch.down_since.is_none();
+    if notify_down {
+        db.set_down_since(id, Some(Utc::now()))?;
+    }
+    let updated = db.get_watch(id)?.context("watch removido")?;
+    Ok(CheckOutcome::Failed {
+        watch: updated,
+        error: error.to_string(),
+        delay_secs: failure_delay_secs(failures, retry_after),
+        notify_down,
+    })
+}
+
+fn open_db(path: &Path) -> Result<Database> {
     Database::open_path(path)
-}
-
-/// Conexão leve para tarefas de checagem (esquema já migrado no início).
-fn connect_db(path: &PathBuf) -> Result<Database> {
-    Database::connect(path)
 }
 
 fn display_label(label: &str, url: &str) -> String {
@@ -355,4 +348,371 @@ fn display_label(label: &str, url: &str) -> String {
 pub fn eta_from_instant(target: Instant) -> chrono::DateTime<Utc> {
     let dur = target.saturating_duration_since(Instant::now());
     Utc::now() + Duration::from_std(dur).unwrap_or_else(|_| Duration::seconds(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Mode;
+    use crate::spec::WatchSpec;
+    use std::sync::OnceLock;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Variáveis globais de ambiente dos testes: banco/perfil só em diretório
+    /// temporário (nunca `~/.curio`) e um "Chrome" de mentira para o modo js.
+    fn test_env() {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let script = dir.join("fake-chrome.sh");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\necho '<html><body><h1>Titulo</h1><p>montado por js</p></body></html>'\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::env::set_var("CURIO_DB", dir.join("curio.db"));
+            std::env::set_var("CURIO_CHROME", &script);
+        });
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        db: Database,
+        server: MockServer,
+        client: Client,
+        id: i64,
+    }
+
+    impl Fixture {
+        async fn new(tweak: impl FnOnce(&mut WatchSpec)) -> Self {
+            test_env();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("t.db");
+            let db = Database::open_path(&path).unwrap();
+            let server = MockServer::start().await;
+            let mut spec = WatchSpec {
+                url: format!("{}/p", server.uri()),
+                interval_secs: 60,
+                ..Default::default()
+            };
+            tweak(&mut spec);
+            let id = db.insert_watch(&spec).unwrap().id;
+            Self {
+                _dir: dir,
+                path,
+                db,
+                server,
+                client: build_client(),
+                id,
+            }
+        }
+
+        async fn serve(&self, body: &str) {
+            self.server.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/p"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn serve_status(&self, status: u16, retry_after: Option<&str>) {
+            self.server.reset().await;
+            let mut resp = ResponseTemplate::new(status);
+            if let Some(v) = retry_after {
+                resp = resp.insert_header("Retry-After", v);
+            }
+            Mock::given(method("GET"))
+                .respond_with(resp)
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn check(&self) -> CheckOutcome {
+            check_watch(&self.client, &self.path, self.id, false).await
+        }
+
+        fn watch(&self) -> Watch {
+            self.db.get_watch(self.id).unwrap().unwrap()
+        }
+    }
+
+    fn ok(outcome: CheckOutcome) -> (Watch, bool, bool, bool) {
+        match outcome {
+            CheckOutcome::Ok {
+                watch,
+                changed,
+                alert,
+                recovered,
+            } => (watch, changed, alert, recovered),
+            CheckOutcome::Failed { error, .. } => panic!("falhou: {error}"),
+            CheckOutcome::SkippedPaused => panic!("pausado"),
+            CheckOutcome::Fatal(e) => panic!("fatal: {e}"),
+        }
+    }
+
+    fn failed(outcome: CheckOutcome) -> (Watch, String, u64, bool) {
+        match outcome {
+            CheckOutcome::Failed {
+                watch,
+                error,
+                delay_secs,
+                notify_down,
+            } => (watch, error, delay_secs, notify_down),
+            CheckOutcome::Ok { .. } => panic!("deveria falhar"),
+            CheckOutcome::SkippedPaused => panic!("pausado"),
+            CheckOutcome::Fatal(e) => panic!("fatal: {e}"),
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_and_is_capped() {
+        assert_eq!(failure_delay_secs(1, None), 60);
+        assert_eq!(failure_delay_secs(2, None), 120);
+        assert_eq!(failure_delay_secs(3, None), 240);
+        assert_eq!(failure_delay_secs(7, None), 3600);
+        assert_eq!(failure_delay_secs(500, None), 3600);
+    }
+
+    #[test]
+    fn retry_after_raises_but_never_lowers_the_delay() {
+        assert_eq!(failure_delay_secs(1, Some(600)), 600);
+        assert_eq!(failure_delay_secs(1, Some(5)), 60);
+        assert_eq!(failure_delay_secs(8, Some(7200)), 7200);
+    }
+
+    #[tokio::test]
+    async fn first_check_stores_snapshot_then_detects_change() {
+        let f = Fixture::new(|_| {}).await;
+
+        f.serve("<p>um</p><p>dois</p>").await;
+        let (w, changed, alert, _) = ok(f.check().await);
+        assert!(!changed && !alert, "primeira leitura não alerta");
+        assert_eq!(w.last_status, WatchStatus::Ok);
+
+        let (_, changed, _, _) = ok(f.check().await);
+        assert!(!changed, "mesmo conteúdo, nada mudou");
+        assert!(f.db.list_changes(f.id, 10).unwrap().is_empty());
+
+        f.serve("<p>um</p><p>TRÊS</p>").await;
+        let (w, changed, alert, _) = ok(f.check().await);
+        assert!(changed && alert);
+        assert_eq!(w.last_status, WatchStatus::Changed);
+        assert!(w.unread_change);
+        let changes = f.db.list_changes(f.id, 10).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].seen);
+        assert!(changes[0].diff_text.contains("- dois"));
+        assert!(changes[0].diff_text.contains("+ TRÊS"));
+        assert!(changes[0].diff_text.contains("  um"), "traz contexto");
+    }
+
+    #[tokio::test]
+    async fn failures_back_off_notify_once_and_recover() {
+        let f = Fixture::new(|_| {}).await;
+        f.serve("<p>ok</p>").await;
+        ok(f.check().await);
+
+        f.serve_status(500, None).await;
+        let expected = [
+            (60, false),
+            (120, false),
+            (240, true),
+            (480, false),
+            (960, false),
+        ];
+        for (i, (delay, notify)) in expected.iter().enumerate() {
+            let (w, err, d, n) = failed(f.check().await);
+            assert_eq!(err, "HTTP 500 Internal Server Error");
+            assert_eq!((d, n), (*delay, *notify), "falha {}", i + 1);
+            assert_eq!(w.consecutive_failures, i as u32 + 1);
+            assert_eq!(w.last_status, WatchStatus::Error);
+        }
+        assert!(f.watch().down_since.is_some());
+
+        f.serve("<p>ok</p>").await;
+        let (w, changed, alert, recovered) = ok(f.check().await);
+        assert!(recovered && !changed && !alert);
+        assert_eq!(w.consecutive_failures, 0);
+        assert!(w.down_since.is_none());
+
+        let (_, _, _, recovered_again) = ok(f.check().await);
+        assert!(!recovered_again, "recuperação é avisada uma única vez");
+    }
+
+    #[tokio::test]
+    async fn downtime_is_not_renotified_after_recovery_cycle_resets() {
+        let f = Fixture::new(|_| {}).await;
+        f.serve_status(503, None).await;
+        let notifications: Vec<bool> = {
+            let mut v = Vec::new();
+            for _ in 0..6 {
+                v.push(failed(f.check().await).3);
+            }
+            v
+        };
+        assert_eq!(notifications, [false, false, true, false, false, false]);
+    }
+
+    #[tokio::test]
+    async fn honors_retry_after_on_429() {
+        let f = Fixture::new(|_| {}).await;
+        f.serve_status(429, Some("600")).await;
+        let (_, err, delay, _) = failed(f.check().await);
+        assert_eq!(err, "HTTP 429 Too Many Requests");
+        assert_eq!(delay, 600);
+
+        f.serve_status(503, Some("5")).await;
+        assert_eq!(
+            failed(f.check().await).2,
+            120,
+            "Retry-After curto não encurta o backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_headers_with_env_expansion() {
+        std::env::set_var("CURIO_TEST_TOKEN_A", "s3cr3t");
+        let f = Fixture::new(|s| {
+            s.headers = "Authorization: Bearer ${CURIO_TEST_TOKEN_A}\nX-Extra: 1".into();
+        })
+        .await;
+        Mock::given(method("GET"))
+            .and(header("authorization", "Bearer s3cr3t"))
+            .and(header("x-extra", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<p>autenticado</p>"))
+            .expect(1)
+            .mount(&f.server)
+            .await;
+        ok(f.check().await);
+        let stored = f.watch();
+        assert!(
+            stored.headers.contains("${CURIO_TEST_TOKEN_A}") && !stored.headers.contains("s3cr3t"),
+            "o banco guarda o modelo, nunca o segredo"
+        );
+        assert_eq!(
+            f.db.latest_snapshot(f.id).unwrap().unwrap().normalized_text,
+            "autenticado"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_env_var_fails_without_sending_the_request() {
+        let f = Fixture::new(|s| {
+            s.headers = "Authorization: Bearer ${CURIO_TEST_TOKEN_NAO_EXISTE}".into();
+        })
+        .await;
+        f.serve("<p>x</p>").await;
+        let (w, err, _, _) = failed(f.check().await);
+        assert!(err.contains("CURIO_TEST_TOKEN_NAO_EXISTE"), "{err}");
+        assert!(!err.contains("Bearer"));
+        assert!(w
+            .last_error
+            .unwrap()
+            .contains("CURIO_TEST_TOKEN_NAO_EXISTE"));
+        assert!(f.server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_mode_flattens_and_diffs_per_leaf() {
+        let f = Fixture::new(|s| {
+            s.mode = Mode::Json;
+            s.selector = "items[*].price".into();
+        })
+        .await;
+        f.serve(r#"{"items":[{"price":10},{"price":20}],"ts":1}"#)
+            .await;
+        ok(f.check().await);
+        assert_eq!(
+            f.db.latest_snapshot(f.id).unwrap().unwrap().normalized_text,
+            "items[0].price: 10\nitems[1].price: 20"
+        );
+        f.serve(r#"{"items":[{"price":10},{"price":18}],"ts":2}"#)
+            .await;
+        let (_, changed, alert, _) = ok(f.check().await);
+        assert!(changed && alert);
+        let diff = f.db.list_changes(f.id, 1).unwrap().remove(0).diff_text;
+        assert!(diff.contains("- items[1].price: 20") && diff.contains("+ items[1].price: 18"));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_counts_as_a_failure() {
+        let f = Fixture::new(|s| s.mode = Mode::Json).await;
+        f.serve("<html>não sou json</html>").await;
+        let (_, err, delay, _) = failed(f.check().await);
+        assert!(err.contains("JSON"), "{err}");
+        assert_eq!(delay, 60);
+    }
+
+    #[tokio::test]
+    async fn condition_gates_alert_but_always_records_history() {
+        let f = Fixture::new(|s| s.condition = "número < 100".into()).await;
+        f.serve("<p>R$ 120</p>").await;
+        ok(f.check().await);
+
+        f.serve("<p>R$ 130</p>").await;
+        let (w, changed, alert, _) = ok(f.check().await);
+        assert!(changed && !alert, "130 não cruzou o limiar");
+        assert!(!w.unread_change);
+        assert_eq!(w.last_status, WatchStatus::Ok);
+
+        f.serve("<p>R$ 90</p>").await;
+        let (w, _, alert, _) = ok(f.check().await);
+        assert!(alert, "130 → 90 cruza o limiar");
+        assert!(w.unread_change);
+
+        f.serve("<p>R$ 85</p>").await;
+        let (_, changed, alert, _) = ok(f.check().await);
+        assert!(changed && !alert, "continua abaixo: sem novo alerta");
+
+        let changes = f.db.list_changes(f.id, 10).unwrap();
+        assert_eq!(changes.len(), 3, "todas as mudanças ficam no histórico");
+        assert_eq!(
+            changes.iter().map(|c| c.seen).collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_is_skipped_unless_forced() {
+        let f = Fixture::new(|_| {}).await;
+        f.serve("<p>x</p>").await;
+        f.db.set_paused(f.id, true).unwrap();
+        assert!(matches!(f.check().await, CheckOutcome::SkippedPaused));
+        assert!(f.server.received_requests().await.unwrap().is_empty());
+
+        let forced = check_watch(&f.client, &f.path, f.id, true).await;
+        let (w, ..) = ok(forced);
+        assert!(w.paused);
+        assert_eq!(w.last_status, WatchStatus::Paused);
+        assert_eq!(f.server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn js_mode_uses_the_browser_output() {
+        let f = Fixture::new(|s| s.mode = Mode::Js).await;
+        let (..) = ok(f.check().await);
+        let snap = f.db.latest_snapshot(f.id).unwrap().unwrap();
+        assert!(snap.normalized_text.contains("montado por js"));
+        assert!(
+            f.server.received_requests().await.unwrap().is_empty(),
+            "o modo js não faz GET direto"
+        );
+    }
+
+    #[tokio::test]
+    async fn selector_without_match_is_a_failure_not_a_panic() {
+        let f = Fixture::new(|s| s.selector = "#nao-existe".into()).await;
+        f.serve("<p>x</p>").await;
+        let (w, err, ..) = failed(f.check().await);
+        assert!(err.contains("seletor"), "{err}");
+        assert_eq!(w.consecutive_failures, 1);
+    }
 }

@@ -2,19 +2,27 @@
 //! Author: Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
 
 mod app;
+mod cli;
+mod condition;
 mod db;
 mod diff;
 mod extract;
+mod fetch;
 mod interval;
+mod jsonq;
 mod model;
 mod monitor;
 mod notify;
+mod spec;
+mod transfer;
 mod ui;
 
 use crate::app::App;
+use crate::cli::Cli;
 use crate::db::{default_db_path, Database};
 use crate::monitor::{run_monitor, ForceCheckSet, ScheduleMap};
 use anyhow::Result;
+use clap::Parser;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -28,7 +36,12 @@ use tokio::sync::{mpsc, Mutex, Notify};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
+    // Subcomandos rodam antes de qualquer modo raw/tela alternativa.
+    let cli = Cli::parse();
     let db_path = default_db_path()?;
+    if let Some(command) = cli.command {
+        return cli::run(command, &db_path);
+    }
     let _ = Database::open_path(&db_path)?;
 
     let (tx, rx) = mpsc::unbounded_channel();

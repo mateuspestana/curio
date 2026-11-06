@@ -20,9 +20,7 @@ pub fn draw(
         .iter()
         .rev()
         .take(20)
-        .map(|m| {
-            ListItem::new(Line::from(Span::styled(m.clone(), theme::status_err())))
-        })
+        .map(|m| ListItem::new(Line::from(Span::styled(m.clone(), theme::status_err()))))
         .collect();
 
     for (change, label, url) in alerts.iter().take(40) {
@@ -31,7 +29,13 @@ pub fn draw(
         items.push(ListItem::new(Line::from(vec![
             Span::styled(format!("{mark} "), theme::status_changed()),
             Span::styled(
-                format!("{}  ", change.detected_at.with_timezone(&chrono::Local).format("%H:%M:%S")),
+                format!(
+                    "{}  ",
+                    change
+                        .detected_at
+                        .with_timezone(&chrono::Local)
+                        .format("%H:%M:%S")
+                ),
                 theme::muted(),
             ),
             Span::styled(format!("mudança · {name}"), theme::normal()),

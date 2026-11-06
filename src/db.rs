@@ -2,8 +2,9 @@
 //! Author: Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
 
 use crate::model::{
-    AppSettings, Change, Density, Snapshot, ThemeMode, Watch, WatchStatus, MAX_SNAPSHOTS_PER_WATCH,
+    AppSettings, Change, Density, Mode, Retention, Snapshot, ThemeMode, Watch, WatchStatus,
 };
+use crate::spec::WatchSpec;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -27,8 +28,8 @@ impl Database {
     /// Abre a conexão sem migrar: WAL + busy_timeout permitem UI e monitor
     /// compartilharem o arquivo sem "database is locked".
     pub fn connect(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)
-            .with_context(|| format!("abrir banco {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("abrir banco {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
         )?;
@@ -87,6 +88,12 @@ impl Database {
         self.ensure_column("watches", "selector", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("watches", "ignore_regex", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("watches", "paused", "INTEGER NOT NULL DEFAULT 0")?;
+        // v0.4.0 — só ADD COLUMN, para o binário 0.3.x continuar lendo o banco.
+        self.ensure_column("watches", "mode", "TEXT NOT NULL DEFAULT 'html'")?;
+        self.ensure_column("watches", "condition", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("watches", "headers", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("watches", "tags", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("watches", "down_since", "TEXT")?;
         Ok(())
     }
 
@@ -97,8 +104,10 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         if !names.iter().any(|n| n == column) {
-            self.conn
-                .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+            self.conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                [],
+            )?;
         }
         Ok(())
     }
@@ -122,13 +131,24 @@ impl Database {
             selector: row.get(10)?,
             ignore_regex: row.get(11)?,
             paused: row.get::<_, i64>(12)? != 0,
+            mode: Mode::parse(&row.get::<_, String>(13)?),
+            condition: row.get(14)?,
+            headers: row.get(15)?,
+            tags: row.get(16)?,
+            down_since: row
+                .get::<_, Option<String>>(17)?
+                .as_deref()
+                .map(parse_dt)
+                .transpose()?,
             next_check_at: None,
         })
     }
 
-    const WATCH_SELECT: &'static str = "SELECT id, url, label, interval_secs, created_at, last_checked_at,
+    const WATCH_SELECT: &'static str =
+        "SELECT id, url, label, interval_secs, created_at, last_checked_at,
             last_status, last_error, unread_change, consecutive_failures,
-            selector, ignore_regex, paused
+            selector, ignore_regex, paused,
+            mode, condition, headers, tags, down_since
      FROM watches";
 
     pub fn list_watches(&self) -> Result<Vec<Watch>> {
@@ -154,52 +174,55 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub fn insert_watch(
-        &self,
-        url: &str,
-        label: &str,
-        interval_secs: u64,
-        selector: &str,
-        ignore_regex: &str,
-    ) -> Result<Watch> {
+    pub fn insert_watch(&self, spec: &WatchSpec) -> Result<Watch> {
         let now = Utc::now();
         self.conn.execute(
-            "INSERT INTO watches (url, label, interval_secs, created_at, last_status, selector, ignore_regex, paused)
-             VALUES (?1, ?2, ?3, ?4, 'waiting', ?5, ?6, 0)",
+            "INSERT INTO watches (url, label, interval_secs, created_at, last_status,
+                selector, ignore_regex, paused, mode, condition, headers, tags)
+             VALUES (?1, ?2, ?3, ?4, 'waiting', ?5, ?6, 0, ?7, ?8, ?9, ?10)",
             params![
-                url,
-                label,
-                interval_secs as i64,
+                spec.url,
+                spec.label,
+                spec.interval_secs as i64,
                 now.to_rfc3339(),
-                selector,
-                ignore_regex
+                spec.selector,
+                spec.ignore_regex,
+                spec.mode.as_str(),
+                spec.condition,
+                spec.headers,
+                spec.tags,
             ],
         )?;
         let id = self.conn.last_insert_rowid();
-        self.get_watch(id)?
-            .context("watch inserido não encontrado")
+        self.get_watch(id)?.context("watch inserido não encontrado")
     }
 
-    pub fn update_watch(
-        &self,
-        id: i64,
-        url: &str,
-        label: &str,
-        interval_secs: u64,
-        selector: &str,
-        ignore_regex: &str,
-    ) -> Result<()> {
+    pub fn update_watch(&self, id: i64, spec: &WatchSpec) -> Result<()> {
         self.conn.execute(
-            "UPDATE watches SET url = ?1, label = ?2, interval_secs = ?3,
-             selector = ?4, ignore_regex = ?5 WHERE id = ?6",
+            "UPDATE watches SET url = ?1, label = ?2, interval_secs = ?3, selector = ?4,
+             ignore_regex = ?5, mode = ?6, condition = ?7, headers = ?8, tags = ?9
+             WHERE id = ?10",
             params![
-                url,
-                label,
-                interval_secs as i64,
-                selector,
-                ignore_regex,
+                spec.url,
+                spec.label,
+                spec.interval_secs as i64,
+                spec.selector,
+                spec.ignore_regex,
+                spec.mode.as_str(),
+                spec.condition,
+                spec.headers,
+                spec.tags,
                 id
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Marca (ou limpa) o início do downtime já notificado.
+    pub fn set_down_since(&self, id: i64, since: Option<DateTime<Utc>>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE watches SET down_since = ?1 WHERE id = ?2",
+            params![since.map(|t| t.to_rfc3339()), id],
         )?;
         Ok(())
     }
@@ -253,13 +276,7 @@ impl Database {
             self.conn.execute(
                 "UPDATE watches SET last_checked_at = ?1, last_status = ?2, last_error = ?3,
                  consecutive_failures = ?4 WHERE id = ?5",
-                params![
-                    now,
-                    status.as_str(),
-                    error,
-                    consecutive_failures as i64,
-                    id
-                ],
+                params![now, status.as_str(), error, consecutive_failures as i64, id],
             )?;
         }
         Ok(())
@@ -309,30 +326,140 @@ impl Database {
     }
 
     fn trim_snapshots(&self, watch_id: i64) -> Result<()> {
+        let keep = self.load_retention()?.max_snapshots.max(1);
         self.conn.execute(
             "DELETE FROM snapshots WHERE watch_id = ?1 AND id NOT IN (
                 SELECT id FROM snapshots WHERE watch_id = ?1
                 ORDER BY fetched_at DESC, id DESC LIMIT ?2
              )",
-            params![watch_id, MAX_SNAPSHOTS_PER_WATCH as i64],
+            params![watch_id, keep as i64],
         )?;
         Ok(())
     }
 
-    pub fn insert_change(&self, watch_id: i64, diff_text: &str) -> Result<Change> {
+    /// `seen = true` registra a mudança no histórico sem acender o alerta.
+    pub fn insert_change(&self, watch_id: i64, diff_text: &str, seen: bool) -> Result<Change> {
         let now = Utc::now();
         self.conn.execute(
-            "INSERT INTO changes (watch_id, detected_at, diff_text, seen) VALUES (?1, ?2, ?3, 0)",
-            params![watch_id, now.to_rfc3339(), diff_text],
+            "INSERT INTO changes (watch_id, detected_at, diff_text, seen) VALUES (?1, ?2, ?3, ?4)",
+            params![watch_id, now.to_rfc3339(), diff_text, seen as i64],
         )?;
         let id = self.conn.last_insert_rowid();
+        let max = self.load_retention()?.max_changes;
+        if max > 0 {
+            self.trim_changes(Some(watch_id), max)?;
+        }
         Ok(Change {
             id,
             watch_id,
             detected_at: now,
             diff_text: diff_text.to_string(),
-            seen: false,
+            seen,
         })
+    }
+
+    /// Mantém só as `max` mudanças mais recentes (por monitor, ou de todos).
+    fn trim_changes(&self, watch_id: Option<i64>, max: u32) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM changes WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY watch_id ORDER BY detected_at DESC, id DESC
+                    ) AS rn, watch_id FROM changes
+                ) WHERE rn > ?1 AND (?2 IS NULL OR watch_id = ?2)
+             )",
+            params![max as i64, watch_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Aplica a política de retenção. Devolve quantas mudanças foram apagadas.
+    pub fn prune(&self) -> Result<usize> {
+        let r = self.load_retention()?;
+        let mut deleted = 0;
+        if r.max_changes > 0 {
+            deleted += self.trim_changes(None, r.max_changes)?;
+        }
+        if r.max_age_days > 0 {
+            let cutoff = Utc::now() - chrono::Duration::days(r.max_age_days as i64);
+            deleted += self.conn.execute(
+                "DELETE FROM changes WHERE detected_at < ?1",
+                params![cutoff.to_rfc3339()],
+            )?;
+        }
+        let keep = r.max_snapshots.max(1);
+        deleted += self.conn.execute(
+            "DELETE FROM snapshots WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY watch_id ORDER BY fetched_at DESC, id DESC
+                    ) AS rn FROM snapshots
+                ) WHERE rn > ?1
+             )",
+            params![keep as i64],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Devolve o espaço ao disco (use depois de apagar linhas).
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn
+            .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
+    pub fn load_retention(&self) -> Result<Retention> {
+        let d = Retention::default();
+        let get = |key: &str, default: u32| -> Result<u32> {
+            Ok(self
+                .get_setting(key)?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default))
+        };
+        Ok(Retention {
+            max_changes: get("retention_max_changes", d.max_changes)?,
+            max_age_days: get("retention_max_age_days", d.max_age_days)?,
+            max_snapshots: get("retention_max_snapshots", d.max_snapshots)?,
+        })
+    }
+
+    pub fn save_retention(&self, r: &Retention) -> Result<()> {
+        self.set_setting("retention_max_changes", &r.max_changes.to_string())?;
+        self.set_setting("retention_max_age_days", &r.max_age_days.to_string())?;
+        self.set_setting("retention_max_snapshots", &r.max_snapshots.to_string())?;
+        Ok(())
+    }
+
+    /// Todas as mudanças (de um monitor ou de todos), da mais antiga à mais nova,
+    /// com rótulo e URL — base da exportação do histórico.
+    pub fn list_changes_for_export(
+        &self,
+        watch_id: Option<i64>,
+    ) -> Result<Vec<(Change, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.watch_id, c.detected_at, c.diff_text, c.seen, w.label, w.url
+             FROM changes c JOIN watches w ON w.id = c.watch_id
+             WHERE (?1 IS NULL OR c.watch_id = ?1)
+             ORDER BY c.watch_id ASC, c.detected_at ASC, c.id ASC",
+        )?;
+        let rows = stmt.query_map(params![watch_id], |row| {
+            Ok((
+                Change {
+                    id: row.get(0)?,
+                    watch_id: row.get(1)?,
+                    detected_at: parse_dt(&row.get::<_, String>(2)?)?,
+                    diff_text: row.get(3)?,
+                    seen: row.get::<_, i64>(4)? != 0,
+                },
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     pub fn list_changes(&self, watch_id: i64, limit: usize) -> Result<Vec<Change>> {
@@ -420,12 +547,27 @@ impl Database {
             .get_setting("density")?
             .map(|v| Density::parse(&v))
             .unwrap_or(Density::Normal);
-        Ok(AppSettings { theme, density })
+        let flag =
+            |key: &str| -> Result<bool> { Ok(self.get_setting(key)?.as_deref() == Some("1")) };
+        Ok(AppSettings {
+            theme,
+            density,
+            diff_context: flag("diff_context")?,
+            diff_side_by_side: flag("diff_side_by_side")?,
+        })
     }
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
         self.set_setting("theme", settings.theme.as_str())?;
         self.set_setting("density", settings.density.as_str())?;
+        self.set_setting(
+            "diff_context",
+            if settings.diff_context { "1" } else { "0" },
+        )?;
+        self.set_setting(
+            "diff_side_by_side",
+            if settings.diff_side_by_side { "1" } else { "0" },
+        )?;
         Ok(())
     }
 
@@ -450,9 +592,22 @@ impl Database {
     }
 }
 
+/// Caminho do banco: `CURIO_DB` (testes/uso avançado) ou `~/.curio/curio.db`.
 pub fn default_db_path() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("CURIO_DB").filter(|p| !p.is_empty()) {
+        return Ok(PathBuf::from(p));
+    }
     let home = dirs_home().context("HOME não definido")?;
     Ok(home.join(".curio").join("curio.db"))
+}
+
+/// Pasta dos dados do Curió (banco, perfil do navegador, exportações).
+pub fn data_dir() -> Result<PathBuf> {
+    let db = default_db_path()?;
+    Ok(db
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".")))
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -470,15 +625,32 @@ fn parse_dt(s: &str) -> std::result::Result<DateTime<Utc>, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DEFAULT_MAX_SNAPSHOTS;
+
+    fn spec(url: &str) -> WatchSpec {
+        WatchSpec {
+            url: url.into(),
+            label: "ex".into(),
+            interval_secs: 60,
+            selector: "#main".into(),
+            ignore_regex: "ts:".into(),
+            ..Default::default()
+        }
+    }
+
+    fn count(db: &Database, table: &str) -> i64 {
+        db.conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
 
     #[test]
     fn crud_and_snapshot_trim() {
         let db = Database::open_in_memory().unwrap();
-        let w = db
-            .insert_watch("https://example.com", "ex", 60, "#main", "ts:")
-            .unwrap();
+        let w = db.insert_watch(&spec("https://example.com")).unwrap();
         assert_eq!(w.selector, "#main");
         assert_eq!(w.ignore_regex, "ts:");
+        assert_eq!(w.mode, Mode::Html);
 
         db.set_paused(w.id, true).unwrap();
         let w2 = db.get_watch(w.id).unwrap().unwrap();
@@ -488,22 +660,176 @@ mod tests {
             db.insert_snapshot(w.id, &format!("h{i}"), &format!("text {i}"))
                 .unwrap();
         }
-        let count: i64 = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM snapshots WHERE watch_id = ?1",
-                params![w.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, MAX_SNAPSHOTS_PER_WATCH as i64);
+        assert_eq!(count(&db, "snapshots"), DEFAULT_MAX_SNAPSHOTS as i64);
 
         let mut settings = db.load_settings().unwrap();
         settings.theme = ThemeMode::Light;
         settings.density = Density::Compact;
+        settings.diff_context = true;
+        settings.diff_side_by_side = true;
         db.save_settings(&settings).unwrap();
         let s2 = db.load_settings().unwrap();
         assert_eq!(s2.theme, ThemeMode::Light);
         assert_eq!(s2.density, Density::Compact);
+        assert!(s2.diff_context && s2.diff_side_by_side);
+    }
+
+    #[test]
+    fn new_fields_roundtrip_through_update() {
+        let db = Database::open_in_memory().unwrap();
+        let w = db.insert_watch(&spec("https://example.com")).unwrap();
+        let mut s = spec("https://api.example.com/x");
+        s.mode = Mode::Json;
+        s.condition = "número < 100".into();
+        s.headers = "Authorization: Bearer ${T}".into();
+        s.tags = "preço,api".into();
+        db.update_watch(w.id, &s).unwrap();
+        let w = db.get_watch(w.id).unwrap().unwrap();
+        assert_eq!(WatchSpec::from_watch(&w), s);
+        assert_eq!(w.tag_list().collect::<Vec<_>>(), vec!["preço", "api"]);
+        assert!(w.down_since.is_none());
+        db.set_down_since(w.id, Some(Utc::now())).unwrap();
+        assert!(db.get_watch(w.id).unwrap().unwrap().down_since.is_some());
+        db.set_down_since(w.id, None).unwrap();
+        assert!(db.get_watch(w.id).unwrap().unwrap().down_since.is_none());
+    }
+
+    #[test]
+    fn migrates_a_v0_3_database_without_losing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            // Esquema exato da v0.3.x (sem as colunas da 0.4).
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE watches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL,
+                    label TEXT NOT NULL DEFAULT '', interval_secs INTEGER NOT NULL,
+                    created_at TEXT NOT NULL, last_checked_at TEXT,
+                    last_status TEXT NOT NULL DEFAULT 'waiting', last_error TEXT,
+                    unread_change INTEGER NOT NULL DEFAULT 0,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    selector TEXT NOT NULL DEFAULT '', ignore_regex TEXT NOT NULL DEFAULT '',
+                    paused INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, watch_id INTEGER NOT NULL,
+                    fetched_at TEXT NOT NULL, content_hash TEXT NOT NULL,
+                    normalized_text TEXT NOT NULL
+                 );
+                 CREATE TABLE changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, watch_id INTEGER NOT NULL,
+                    detected_at TEXT NOT NULL, diff_text TEXT NOT NULL,
+                    seen INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO watches (url, label, interval_secs, created_at, selector)
+                    VALUES ('https://a.example', 'A', 600, '2026-01-01T00:00:00+00:00', '#x');
+                 INSERT INTO snapshots (watch_id, fetched_at, content_hash, normalized_text)
+                    VALUES (1, '2026-01-01T00:00:00+00:00', 'h', 't');
+                 INSERT INTO changes (watch_id, detected_at, diff_text)
+                    VALUES (1, '2026-01-02T00:00:00+00:00', '- a\n+ b');",
+            )
+            .unwrap();
+        }
+        let db = Database::open_path(&path).unwrap();
+        let w = db.list_watches().unwrap().remove(0);
+        assert_eq!(
+            (w.url.as_str(), w.label.as_str(), w.selector.as_str()),
+            ("https://a.example", "A", "#x")
+        );
+        assert_eq!(w.mode, Mode::Html);
+        assert!(w.condition.is_empty() && w.headers.is_empty() && w.tags.is_empty());
+        assert_eq!(db.latest_snapshot(1).unwrap().unwrap().content_hash, "h");
+        assert_eq!(db.list_changes(1, 10).unwrap().len(), 1);
+        // Migrar duas vezes é inofensivo.
+        let db = Database::open_path(&path).unwrap();
+        assert_eq!(db.list_watches().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retention_trims_changes_by_count_per_watch() {
+        let db = Database::open_in_memory().unwrap();
+        let a = db.insert_watch(&spec("https://a.example")).unwrap();
+        let b = db.insert_watch(&spec("https://b.example")).unwrap();
+        db.save_retention(&Retention {
+            max_changes: 3,
+            ..Retention::default()
+        })
+        .unwrap();
+        for i in 0..6 {
+            db.insert_change(a.id, &format!("+ a{i}"), false).unwrap();
+        }
+        db.insert_change(b.id, "+ b0", false).unwrap();
+        let a_left = db.list_changes(a.id, 100).unwrap();
+        assert_eq!(a_left.len(), 3);
+        assert_eq!(a_left[0].diff_text, "+ a5");
+        assert_eq!(db.list_changes(b.id, 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_applies_age_and_count_and_zero_means_unlimited() {
+        let db = Database::open_in_memory().unwrap();
+        let w = db.insert_watch(&spec("https://a.example")).unwrap();
+        db.save_retention(&Retention {
+            max_changes: 0,
+            max_age_days: 0,
+            max_snapshots: 20,
+        })
+        .unwrap();
+        for i in 0..5 {
+            db.insert_change(w.id, &format!("+ x{i}"), true).unwrap();
+        }
+        db.conn
+            .execute(
+                "UPDATE changes SET detected_at = '2020-01-01T00:00:00+00:00' WHERE id <= 2",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.prune().unwrap(), 0, "sem limites nada é apagado");
+        db.save_retention(&Retention {
+            max_changes: 0,
+            max_age_days: 30,
+            max_snapshots: 20,
+        })
+        .unwrap();
+        assert_eq!(db.prune().unwrap(), 2);
+        db.save_retention(&Retention {
+            max_changes: 1,
+            max_age_days: 0,
+            max_snapshots: 1,
+        })
+        .unwrap();
+        db.insert_snapshot(w.id, "h1", "t1").unwrap();
+        db.insert_snapshot(w.id, "h2", "t2").unwrap();
+        db.prune().unwrap();
+        assert_eq!(count(&db, "changes"), 1);
+        assert_eq!(count(&db, "snapshots"), 1);
+        assert_eq!(
+            db.latest_snapshot(w.id).unwrap().unwrap().content_hash,
+            "h2"
+        );
+        db.vacuum().unwrap();
+    }
+
+    #[test]
+    fn suppressed_change_is_recorded_as_seen() {
+        let db = Database::open_in_memory().unwrap();
+        let w = db.insert_watch(&spec("https://a.example")).unwrap();
+        db.insert_change(w.id, "+ x", true).unwrap();
+        assert!(db.list_changes(w.id, 10).unwrap()[0].seen);
+    }
+
+    #[test]
+    fn retention_defaults_and_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.load_retention().unwrap(), Retention::default());
+        let r = Retention {
+            max_changes: 7,
+            max_age_days: 9,
+            max_snapshots: 2,
+        };
+        db.save_retention(&r).unwrap();
+        assert_eq!(db.load_retention().unwrap(), r);
     }
 }

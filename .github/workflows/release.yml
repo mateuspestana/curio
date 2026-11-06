@@ -1,0 +1,98 @@
+name: Release
+
+# Dispara ao empurrar uma tag vX.Y.Z (a versão precisa bater com o Cargo.toml).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: curio-linux-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: curio-linux-x86_64-musl
+            musl: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: curio-macos-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: curio-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: curio-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Conferir tag x Cargo.toml
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "A tag ${GITHUB_REF_NAME} não bate com a versão ${version} do Cargo.toml" >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Ferramentas do musl (SQLite embutido precisa de um compilador C)
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Separar o binário
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/curio"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then src="${src}.exe"; fi
+          cp "$src" "${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: publicar release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Criar/atualizar a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          sha256sum curio-* > SHA256SUMS
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$REPO" \
+              --title "Curió $GITHUB_REF_NAME" --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" curio-* SHA256SUMS --clobber --repo "$REPO"

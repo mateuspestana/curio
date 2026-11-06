@@ -41,9 +41,7 @@ pub fn parse_interval(input: &str) -> Result<u64, IntervalError> {
         return Err(IntervalError::InvalidFormat);
     }
 
-    let amount: u64 = num_part
-        .parse()
-        .map_err(|_| IntervalError::InvalidAmount)?;
+    let amount: u64 = num_part.parse().map_err(|_| IntervalError::InvalidAmount)?;
     if amount == 0 {
         return Err(IntervalError::InvalidAmount);
     }
@@ -73,13 +71,13 @@ pub fn parse_interval(input: &str) -> Result<u64, IntervalError> {
 
 /// Format seconds as a compact human string (largest fitting unit when exact).
 pub fn format_interval(secs: u64) -> String {
-    if secs % 604800 == 0 {
+    if secs.is_multiple_of(604800) {
         format!("{}w", secs / 604800)
-    } else if secs % 86400 == 0 {
+    } else if secs.is_multiple_of(86400) {
         format!("{}d", secs / 86400)
-    } else if secs % 3600 == 0 {
+    } else if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
