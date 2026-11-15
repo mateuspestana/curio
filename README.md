@@ -75,3 +75,8 @@ Detecção usa **texto visível normalizado** (um item por linha: o histórico m
 [GNU GPL v3](LICENSE) (GPL-3.0-only).
 
 Copyright (c) 2026 Matheus C. Pestana — MACAPE Pesquisas e Consultoria em Tecnologia Ltda
+
+
+## Como citar
+
+Em trabalhos acadêmicos, cite o Curió com o nome do software, a autoria e a versão utilizada. Quando disponível, inclua o DOI da versão arquivada no Zenodo.
