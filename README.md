@@ -1,5 +1,7 @@
 # Curió
 
+[![DOI](https://zenodo.org/badge/1446224532.svg)](https://doi.org/10.5281/zenodo.24238080)
+
 [![versão](https://img.shields.io/github/v/release/mateuspestana/curio?label=versão)](https://github.com/mateuspestana/curio/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/mateuspestana/curio/ci.yml?branch=main&label=CI)](https://github.com/mateuspestana/curio/actions/workflows/ci.yml)
 [![licença](https://img.shields.io/github/license/mateuspestana/curio?label=licença)](LICENSE)
